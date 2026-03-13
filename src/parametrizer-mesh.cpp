@@ -7,6 +7,9 @@
 #include "subdivide.hpp"
 #include "dedge.hpp"
 #include <queue>
+#ifdef WITH_CUDA
+#include "init_kernels.hpp"
+#endif
 
 namespace qflow {
 
@@ -45,8 +48,10 @@ void Parametrizer::Load(const char* filename) {
 }
 
 void Parametrizer::Initialize(int faces) {
+    unsigned long long t0 = GetCurrentTime64(), t1;
     ComputeMeshStatus();
-    //ComputeCurvature(V, F, rho);
+    t1 = GetCurrentTime64(); printf("[INIT] ComputeMeshStatus: %lf s\n", (t1-t0)*1e-3); t0=t1;
+
     rho.resize(V.cols(), 1);
     for (int i = 0; i < V.cols(); ++i) {
         rho[i] = 1;
@@ -68,12 +73,47 @@ void Parametrizer::Initialize(int faces) {
     if (target_len < max_edge_length) {
         while (!compute_direct_graph(V, F, V2E, E2E, boundary, nonManifold))
             ;
-        subdivide(F, V, rho, V2E, E2E, boundary, nonManifold, target_len);
+        t1 = GetCurrentTime64(); printf("[INIT] compute_direct_graph (pre-subdiv): %lf s\n", (t1-t0)*1e-3); t0=t1;
+        subdivide(F, V, rho, V2E, E2E, boundary, nonManifold, target_len, hierarchy.subdiv_strategy);
+        t1 = GetCurrentTime64(); printf("[INIT] subdivide: %lf s\n", (t1-t0)*1e-3); t0=t1;
     }
-    
+
     while (!compute_direct_graph(V, F, V2E, E2E, boundary, nonManifold))
         ;
+    t1 = GetCurrentTime64(); printf("[INIT] compute_direct_graph (post): %lf s\n", (t1-t0)*1e-3); t0=t1;
+
+#ifdef WITH_CUDA
+    {
+        int *csr_rowPtr, *csr_colInd;
+        double *csr_weights;
+        int nnz;
+        cuda_generate_adjacency_matrix(
+            F.data(), F.cols(),
+            V2E.data(), E2E.data(),
+            nonManifold.data(), V.cols(),
+            &csr_rowPtr, &csr_colInd, &csr_weights, &nnz);
+
+        // Convert CSR to AdjacentMatrix (vector<vector<Link>>)
+        adj.resize(V.cols());
+        for (int i = 0; i < V.cols(); ++i) {
+            int start = csr_rowPtr[i];
+            int end = csr_rowPtr[i + 1];
+            adj[i].resize(end - start);
+            for (int j = start; j < end; ++j) {
+                adj[i][j - start] = Link(csr_colInd[j], csr_weights[j]);
+            }
+        }
+        t1 = GetCurrentTime64(); printf("[INIT] generate_adjacency_matrix: %lf s\n", (t1-t0)*1e-3); t0=t1;
+
+        // GPU rho smoothing
+        cuda_rho_smooth(csr_rowPtr, csr_colInd, V.cols(), nnz, rho.data(), 5);
+
+        free(csr_rowPtr); free(csr_colInd); free(csr_weights);
+    }
+    t1 = GetCurrentTime64(); printf("[INIT] rho smoothing: %lf s\n", (t1-t0)*1e-3); t0=t1;
+#else
     generate_adjacency_matrix_uniform(F, V2E, E2E, nonManifold, adj);
+    t1 = GetCurrentTime64(); printf("[INIT] generate_adjacency_matrix: %lf s\n", (t1-t0)*1e-3); t0=t1;
 
     for (int iter = 0; iter < 5; ++iter) {
         VectorXd r(rho.size());
@@ -85,13 +125,19 @@ void Parametrizer::Initialize(int faces) {
         }
         rho = r;
     }
+    t1 = GetCurrentTime64(); printf("[INIT] rho smoothing: %lf s\n", (t1-t0)*1e-3); t0=t1;
+#endif
+
     ComputeSharpEdges();
+    t1 = GetCurrentTime64(); printf("[INIT] ComputeSharpEdges: %lf s\n", (t1-t0)*1e-3); t0=t1;
     ComputeSmoothNormal();
+    t1 = GetCurrentTime64(); printf("[INIT] ComputeSmoothNormal: %lf s\n", (t1-t0)*1e-3); t0=t1;
     ComputeVertexArea();
-    
+    t1 = GetCurrentTime64(); printf("[INIT] ComputeVertexArea: %lf s\n", (t1-t0)*1e-3); t0=t1;
+
     if (flag_adaptive_scale)
         ComputeInverseAffine();
-    
+
 #ifdef LOG_OUTPUT
     printf("V: %d F: %d\n", (int)V.cols(), (int)F.cols());
 #endif
@@ -223,8 +269,21 @@ void Parametrizer::ComputeSharpO() {
 }
 
 void Parametrizer::ComputeSmoothNormal() {
-    /* Compute face normals */
     Nf.resize(3, F.cols());
+    N.resize(3, V.cols());
+
+#ifdef WITH_CUDA
+    cuda_compute_smooth_normal(
+        F.data(), F.cols(),
+        V.data(), V.cols(),
+        V2E.data(),
+        E2E.data(),
+        nonManifold.data(),
+        sharp_edges.data(),
+        N.data(),
+        Nf.data());
+#else
+    /* Compute face normals */
 #ifdef WITH_OMP
 #pragma omp parallel for
 #endif
@@ -239,8 +298,7 @@ void Parametrizer::ComputeSmoothNormal() {
         }
         Nf.col(f) = n;
     }
-    
-    N.resize(3, V.cols());
+
 #ifdef WITH_OMP
 #pragma omp parallel for
 #endif
@@ -250,8 +308,8 @@ void Parametrizer::ComputeSmoothNormal() {
             N.col(i) = Vector3d::UnitX();
             continue;
         }
-        
-        
+
+
         int stop = edge;
         do {
             if (sharp_edges[edge])
@@ -267,18 +325,18 @@ void Parametrizer::ComputeSmoothNormal() {
         Vector3d normal = Vector3d::Zero();
         do {
             int idx = edge % 3;
-            
+
             Vector3d d0 = V.col(F((idx + 1) % 3, edge / 3)) - V.col(i);
             Vector3d d1 = V.col(F((idx + 2) % 3, edge / 3)) - V.col(i);
             double angle = fast_acos(d0.dot(d1) / std::sqrt(d0.squaredNorm() * d1.squaredNorm()));
-            
+
             /* "Computing Vertex Normals from Polygonal Facets"
              by Grit Thuermer and Charles A. Wuethrich, JGT 1998, Vol 3 */
             if (std::isfinite(angle)) normal += Nf.col(edge / 3) * angle;
-            
+
             int opp = E2E[edge];
             if (opp == -1) break;
-            
+
             edge = dedge_next_3(opp);
             if (sharp_edges[edge])
                 break;
@@ -286,12 +344,22 @@ void Parametrizer::ComputeSmoothNormal() {
         double norm = normal.norm();
         N.col(i) = norm > RCPOVERFLOW ? Vector3d(normal / norm) : Vector3d::UnitX();
     }
+#endif
 }
 
 void Parametrizer::ComputeVertexArea() {
     A.resize(V.cols());
     A.setZero();
-    
+
+#ifdef WITH_CUDA
+    cuda_compute_vertex_area(
+        F.data(), F.cols(),
+        V.data(), V.cols(),
+        V2E.data(),
+        E2E.data(),
+        nonManifold.data(),
+        A.data());
+#else
 #ifdef WITH_OMP
 #pragma omp parallel for
 #endif
@@ -301,25 +369,26 @@ void Parametrizer::ComputeVertexArea() {
         double vertex_area = 0;
         do {
             int ep = dedge_prev_3(edge), en = dedge_next_3(edge);
-            
+
             Vector3d v = V.col(F(edge % 3, edge / 3));
             Vector3d vn = V.col(F(en % 3, en / 3));
             Vector3d vp = V.col(F(ep % 3, ep / 3));
-            
+
             Vector3d face_center = (v + vp + vn) * (1.0f / 3.0f);
             Vector3d prev = (v + vp) * 0.5f;
             Vector3d next = (v + vn) * 0.5f;
-            
+
             vertex_area += 0.5f * ((v - prev).cross(v - face_center).norm() +
                                    (v - next).cross(v - face_center).norm());
-            
+
             int opp = E2E[edge];
             if (opp == -1) break;
             edge = dedge_next_3(opp);
         } while (edge != stop);
-        
+
         A[i] = vertex_area;
     }
+#endif
 }
 
 void Parametrizer::FixValence()

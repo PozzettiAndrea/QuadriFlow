@@ -10,6 +10,9 @@
 #ifdef WITH_TBB
 #include "tbb/tbb.h"
 #endif
+#ifdef WITH_CUDA
+#include "init_kernels.hpp"
+#endif
 namespace qflow {
 
 inline int dedge_prev(int e, int deg) { return (e % deg == 0u) ? e + (deg - 1) : e - 1; }
@@ -29,6 +32,27 @@ const int INVALID = -1;
 #undef min
 bool compute_direct_graph(MatrixXd& V, MatrixXi& F, VectorXi& V2E, VectorXi& E2E,
                           VectorXi& boundary, VectorXi& nonManifold) {
+#ifdef WITH_CUDA
+    V2E.resize(V.cols());
+    E2E.resize(F.cols() * 3);
+    boundary.resize(V.cols());
+    nonManifold.resize(V.cols());
+    cuda_compute_direct_graph(
+        V.data(), V.cols(),
+        F.data(), F.cols(),
+        V2E.data(), E2E.data(),
+        boundary.data(), nonManifold.data());
+    // Count for log output
+    int boundaryCounter = 0, nonManifoldCounter = 0;
+    for (int i = 0; i < V.cols(); ++i) {
+        if (boundary[i]) boundaryCounter++;
+        if (nonManifold[i]) nonManifoldCounter++;
+    }
+#ifdef LOG_OUTPUT
+    printf("counter triangle %d %d\n", boundaryCounter, nonManifoldCounter);
+#endif
+    return true;
+#else
     V2E.resize(V.cols());
     V2E.setConstant(INVALID);
 
@@ -196,6 +220,7 @@ bool compute_direct_graph(MatrixXd& V, MatrixXi& F, VectorXi& V2E, VectorXi& E2E
         return false;
     }
     return true;
+#endif // WITH_CUDA
 }
 
 void compute_direct_graph_quad(std::vector<Vector3d>& V, std::vector<Vector4i>& F, std::vector<int>& V2E, std::vector<int>& E2E, VectorXi& boundary, VectorXi& nonManifold) {
