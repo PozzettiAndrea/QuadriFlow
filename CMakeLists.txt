@@ -1,12 +1,19 @@
-cmake_minimum_required(VERSION 3.5)
-project(QuadriFlow LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.18)
+set(CMAKE_CUDA_ARCHITECTURES "86")
+option(BUILD_CUDA "Enable CUDA acceleration" ON)
+if (BUILD_CUDA)
+    project(QuadriFlow LANGUAGES CXX CUDA)
+else()
+    project(QuadriFlow LANGUAGES CXX)
+endif()
 
 option(BUILD_PERFORMANCE_TEST "More subdivisition for performance test" OFF)
-option(BUILD_LOG "Enable verbose log" OFF)
+option(BUILD_LOG "Enable verbose log" ON)
 option(BUILD_GUROBI "Enable GUROBI for comparison ONLY" OFF)
 option(BUILD_OPENMP "Enable support for OpenMP" OFF)
 option(BUILD_TBB "Enable support for TBB" OFF)
 option(BUILD_FREE_LICENSE "Only use libraries with permissive licenses" OFF)
+option(BUILD_LEMON_FLOW "Use LEMON Preflow instead of Boost Boykov for max-flow" ON)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
 set(Boost_USE_STATIC_LIBS ON)
@@ -103,6 +110,16 @@ if (BUILD_FREE_LICENSE)
     add_definitions(-DEIGEN_MPL2_ONLY)
 endif(BUILD_FREE_LICENSE)
 
+if (BUILD_LEMON_FLOW)
+    add_definitions(-DWITH_LEMON_FLOW)
+endif(BUILD_LEMON_FLOW)
+
+if (BUILD_CUDA)
+    add_definitions(-DWITH_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    set(CMAKE_CUDA_STANDARD 14)
+    set(CMAKE_CUDA_ARCHITECTURES "86")  # RTX A6000 = SM 86
+endif(BUILD_CUDA)
 
 set(
     quadriflow_SRC
@@ -127,6 +144,8 @@ set(
     src/merge-vertex.hpp
     src/optimizer.cpp
     src/optimizer.hpp
+    src/checkpoint.cpp
+    src/checkpoint.hpp
     src/parametrizer.cpp
     src/parametrizer-flip.cpp
     src/parametrizer-int.cpp
@@ -138,6 +157,10 @@ set(
     src/subdivide.cpp
     src/subdivide.hpp
 )
+
+if (BUILD_CUDA)
+    list(APPEND quadriflow_SRC src/Optimizer.cu src/cuda_maxflow.cu src/init_kernels.cu src/downsample_gpu.cu src/subdivide_gpu.cu)
+endif()
 
 add_executable(
     quadriflow_exe   # https://discourse.cmake.org/t/how-to-use-the-same-name-for-a-target-and-a-library/5044
@@ -151,6 +174,12 @@ add_library(
 
 set_property(TARGET quadriflow_exe PROPERTY OUTPUT_NAME quadriflow)                                          
 
+if (BUILD_CUDA)
+    set_source_files_properties(src/Optimizer.cu src/cuda_maxflow.cu src/init_kernels.cu src/downsample_gpu.cu PROPERTIES LANGUAGE CUDA)
+    set_target_properties(quadriflow PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+    set_target_properties(quadriflow_exe PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+endif()
+
 target_link_libraries(
     quadriflow
     ${TBB_LIBRARIES}
@@ -158,10 +187,14 @@ target_link_libraries(
     ${GUROBI_LIBRARIES}
 )
 
-
 target_link_libraries(
     quadriflow_exe
     ${TBB_LIBRARIES}
     ${LEMON_LIBRARIES}
     ${GUROBI_LIBRARIES}
 )
+
+if (BUILD_CUDA)
+    target_link_libraries(quadriflow CUDA::cudart CUDA::cusolver CUDA::cusparse)
+    target_link_libraries(quadriflow_exe CUDA::cudart CUDA::cusolver CUDA::cusparse)
+endif()
