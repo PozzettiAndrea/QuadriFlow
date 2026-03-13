@@ -2,6 +2,7 @@
 
 #include <Eigen/Sparse>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -13,11 +14,19 @@
 #include "flow.hpp"
 #include "parametrizer.hpp"
 
-namespace qflow {
-
 #ifdef WITH_CUDA
-#    include <cuda_runtime.h>
+#include <cuda_runtime.h>
+extern "C" int cuda_cholesky_solve(int n, int nnz,
+    const int* h_csrRowPtr, const int* h_csrColInd, const double* h_csrVal,
+    const double* h_b, double* h_x);
+extern "C" void* cuda_pcg_init(int n, int nnz,
+    const int* h_csrRowPtr, const int* h_csrColInd, const double* h_csrVal);
+extern "C" int cuda_pcg_solve(void* context,
+    const double* h_csrVal, const double* h_b, double* h_x);
+extern "C" void cuda_pcg_destroy(void* context);
 #endif
+
+namespace qflow {
 
 #ifndef EIGEN_MPL2_ONLY
 template<class T>
@@ -224,12 +233,31 @@ void Optimizer::optimize_scale(Hierarchy& mRes, VectorXd& rho, int adaptive) {
             }
         }
         A.setFromTriplets(lhsTriplets.begin(), lhsTriplets.end());
-        LinearSolver<Eigen::SparseMatrix<double>> solver;
-        solver.analyzePattern(A);
-
-        solver.factorize(A);
-
-        VectorXd result = solver.solve(rhs);
+        VectorXd result;
+#ifdef WITH_CUDA
+        {
+            Eigen::SparseMatrix<double, Eigen::RowMajor> A_csr(A);
+            int n = A_csr.rows();
+            int nnz_val = A_csr.nonZeros();
+            result.resize(n);
+            int ret = cuda_cholesky_solve(n, nnz_val,
+                A_csr.outerIndexPtr(), A_csr.innerIndexPtr(), A_csr.valuePtr(),
+                rhs.data(), result.data());
+            if (ret != 0) {
+                LinearSolver<Eigen::SparseMatrix<double>> solver;
+                solver.analyzePattern(A);
+                solver.factorize(A);
+                result = solver.solve(rhs);
+            }
+        }
+#else
+        {
+            LinearSolver<Eigen::SparseMatrix<double>> solver;
+            solver.analyzePattern(A);
+            solver.factorize(A);
+            result = solver.solve(rhs);
+        }
+#endif
 
         double total_area = 0;
         for (int i = 0; i < V.cols(); ++i) {
@@ -560,25 +588,129 @@ void Optimizer::optimize_positions_dynamic(
 
     BuildConnection();
     int max_iter = 10;
-    for (int iter = 0; iter < max_iter; ++iter) {
-        FindNearest();
-        ComputeDistance();
 
-        std::vector<std::unordered_map<int, double>> entries(O_compact.size() * 2);
-        std::vector<int> fixed_dim(O_compact.size() * 2, 0);
-        for (auto& info : compact_sharp_constraints) {
-            fixed_dim[info.first * 2 + 1] = 1;
-            if (info.second.second.norm() < 0.5) fixed_dim[info.first * 2] = 1;
+    // Precompute CSR pattern + edge list (constant across iterations)
+    int dim = O_compact.size() * 2;
+    std::vector<int> fixed_dim(dim, 0);
+    for (auto& info : compact_sharp_constraints) {
+        fixed_dim[info.first * 2 + 1] = 1;
+        if (info.second.second.norm() < 0.5) fixed_dim[info.first * 2] = 1;
+    }
+
+    // Flatten links into edge list: (i, j, de_index)
+    struct EdgeEntry { int i, j, de; };
+    std::vector<EdgeEntry> edge_list;
+    edge_list.reserve(O_compact.size() * 6);
+    for (int i = 0; i < (int)O_compact.size(); ++i) {
+        auto dedge_it = dedges[i].begin();
+        for (auto it = links[i].begin(); it != links[i].end(); ++it, ++dedge_it) {
+            int j = *it;
+            int de = o2e[std::make_pair(i, j)];
+            edge_list.push_back({i, j, de});
         }
-        std::vector<double> b(O_compact.size() * 2);
-        std::vector<double> x(O_compact.size() * 2);
+    }
+
+    // Determine which rows have entries
+    std::vector<bool> row_has_entry(dim, false);
+    for (auto& e : edge_list) {
+        if (!fixed_dim[e.j * 2])     row_has_entry[e.j * 2] = true;
+        if (!fixed_dim[e.j * 2 + 1]) row_has_entry[e.j * 2 + 1] = true;
+        if (!fixed_dim[e.i * 2])     row_has_entry[e.i * 2] = true;
+        if (!fixed_dim[e.i * 2 + 1]) row_has_entry[e.i * 2 + 1] = true;
+    }
+
+    // Build CSR pattern using first-iteration approach: collect (row, col) pairs
+    // Each non-fixed edge contributes a 4x4 block (filtered by fixed_dim)
+    // Use std::map for sorted column indices per row
+    std::vector<std::map<int, int>> row_cols(dim);  // row -> {col -> value_index}
+    int val_count = 0;
+    // Edge contributions
+    for (int ei = 0; ei < (int)edge_list.size(); ++ei) {
+        auto& e = edge_list[ei];
+        int vid[] = {e.j * 2, e.j * 2 + 1, e.i * 2, e.i * 2 + 1};
+        for (int ii = 0; ii < 4; ++ii) {
+            if (fixed_dim[vid[ii]]) continue;
+            for (int jj = 0; jj < 4; ++jj) {
+                if (fixed_dim[vid[jj]]) continue;
+                row_cols[vid[ii]][vid[jj]] = -1;  // placeholder
+            }
+        }
+    }
+    // Diagonal for fixed and empty rows
+    for (int i = 0; i < dim; ++i) {
+        if (fixed_dim[i] || !row_has_entry[i]) {
+            row_cols[i][i] = -1;
+        }
+    }
+    // Assign CSR positions
+    std::vector<int> csr_rowPtr(dim + 1);
+    csr_rowPtr[0] = 0;
+    for (int i = 0; i < dim; ++i) {
+        csr_rowPtr[i + 1] = csr_rowPtr[i] + (int)row_cols[i].size();
+    }
+    int csr_nnz = csr_rowPtr[dim];
+    std::vector<int> csr_colInd(csr_nnz);
+    // Fill column indices and assign value positions
+    for (int i = 0; i < dim; ++i) {
+        int pos = csr_rowPtr[i];
+        for (auto& kv : row_cols[i]) {
+            kv.second = pos;  // store position
+            csr_colInd[pos] = kv.first;
+            pos++;
+        }
+    }
+
+    // Build edge-to-CSR-position mapping: for each edge, 16 positions (or -1 if fixed)
+    std::vector<std::array<int, 16>> edge_csr_pos(edge_list.size());
+    for (int ei = 0; ei < (int)edge_list.size(); ++ei) {
+        auto& e = edge_list[ei];
+        int vid[] = {e.j * 2, e.j * 2 + 1, e.i * 2, e.i * 2 + 1};
+        for (int ii = 0; ii < 4; ++ii) {
+            for (int jj = 0; jj < 4; ++jj) {
+                if (fixed_dim[vid[ii]] || fixed_dim[vid[jj]]) {
+                    edge_csr_pos[ei][ii * 4 + jj] = -1;
+                } else {
+                    edge_csr_pos[ei][ii * 4 + jj] = row_cols[vid[ii]][vid[jj]];
+                }
+            }
+        }
+    }
+    // Position of diagonal entries for RHS fixup of fixed columns
+    // For each edge, for each non-fixed row affected by a fixed column
+    struct FixedColEntry { int val_pos; int rhs_row; int fixed_col; };
+    std::vector<FixedColEntry> fixed_col_entries;
+    // Also track diagonal positions for fixed/empty rows
+    std::vector<int> diag_pos(dim, -1);
+    for (int i = 0; i < dim; ++i) {
+        auto it = row_cols[i].find(i);
+        if (it != row_cols[i].end()) diag_pos[i] = it->second;
+    }
+
+    // Precompute RHS fixup mapping for fixed columns
+    // When fixed_dim[col]=1 and !fixed_dim[row], we need: rhs[row] -= A[row][col] * x[col]
+    // These entries exist in the original (unfixed) matrix but not in CSR
+    // We'll handle this during value filling
+
+#ifdef WITH_CUDA
+    void* pcg_ctx = nullptr;
+#endif
+    for (int iter = 0; iter < max_iter; ++iter) {
+        int _t0 = GetCurrentTime64();
+        FindNearest();
+        int _t1 = GetCurrentTime64();
+        ComputeDistance();
+        int _t2 = GetCurrentTime64();
+
+        // Build compact vectors from current Vind
+        std::vector<double> b(dim, 0.0);
+        std::vector<double> x(dim);
         std::vector<Vector3d> Q_compact(O_compact.size());
         std::vector<Vector3d> N_compact(O_compact.size());
         std::vector<Vector3d> V_compact(O_compact.size());
 #ifdef WITH_OMP
 #pragma omp parallel for
 #endif
-        for (int i = 0; i < O_compact.size(); ++i) {
+        for (int i = 0; i < (int)O_compact.size(); ++i) {
             Q_compact[i] = Q.col(Vind[i]);
             N_compact[i] = N.col(Vind[i]);
             V_compact[i] = V.col(Vind[i]);
@@ -587,7 +719,7 @@ void Optimizer::optimize_positions_dynamic(
                 V_compact[i] = compact_sharp_constraints[i].first;
             }
         }
-        for (int i = 0; i < O_compact.size(); ++i) {
+        for (int i = 0; i < (int)O_compact.size(); ++i) {
             Vector3d q = Q_compact[i];
             Vector3d n = N_compact[i];
             Vector3d q_y = n.cross(q);
@@ -595,105 +727,115 @@ void Optimizer::optimize_positions_dynamic(
             x[i * 2] = (O_compact[i] - Vi).dot(q);
             x[i * 2 + 1] = (O_compact[i] - Vi).dot(q_y);
         }
-        for (int i = 0; i < O_compact.size(); ++i) {
-            Vector3d qx = Q_compact[i];
-            Vector3d qy = N_compact[i];
-            qy = qy.cross(qx);
-            auto dedge_it = dedges[i].begin();
-            for (auto it = links[i].begin(); it != links[i].end(); ++it, ++dedge_it) {
-                int j = *it;
-                Vector3d qx2 = Q_compact[j];
-                Vector3d qy2 = N_compact[j];
-                qy2 = qy2.cross(qx2);
+        int _t3 = GetCurrentTime64();
 
-                int de = o2e[std::make_pair(i, j)];
-                double lambda = (diff_count[de] == 1) ? 1 : 1;
-                Vector3d target_offset = diffs[de];
+        // Fill CSR values + RHS directly (no triplets, no Eigen)
+        std::vector<double> csr_val(csr_nnz, 0.0);
+        VectorXd rhs = VectorXd::Zero(dim);
 
-                auto Vi = V_compact[i];
-                auto Vj = V_compact[j];
+        for (int ei = 0; ei < (int)edge_list.size(); ++ei) {
+            auto& e = edge_list[ei];
+            Vector3d qx = Q_compact[e.i];
+            Vector3d qy = N_compact[e.i].cross(qx);
+            Vector3d qx2 = Q_compact[e.j];
+            Vector3d qy2 = N_compact[e.j].cross(qx2);
+            Vector3d target_offset = diffs[e.de];
+            Vector3d C = target_offset - (V_compact[e.j] - V_compact[e.i]);
 
-                Vector3d offset = Vj - Vi;
+            int vid[] = {e.j * 2, e.j * 2 + 1, e.i * 2, e.i * 2 + 1};
+            Vector3d weights[] = {qx2, qy2, -qx, -qy};
 
-                //                target_offset.normalize();
-                //                target_offset *= mScale;
-                Vector3d C = target_offset - offset;
-                int vid[] = {j * 2, j * 2 + 1, i * 2, i * 2 + 1};
-                Vector3d weights[] = {qx2, qy2, -qx, -qy};
-                for (int ii = 0; ii < 4; ++ii) {
-                    for (int jj = 0; jj < 4; ++jj) {
-                        auto it = entries[vid[ii]].find(vid[jj]);
-                        if (it == entries[vid[ii]].end()) {
-                            entries[vid[ii]][vid[jj]] = lambda * weights[ii].dot(weights[jj]);
-                        } else {
-                            entries[vid[ii]][vid[jj]] += lambda * weights[ii].dot(weights[jj]);
-                        }
-                    }
-                    b[vid[ii]] += lambda * weights[ii].dot(C);
-                }
-            }
-        }
-
-        // fix sharp edges
-        for (int i = 0; i < entries.size(); ++i) {
-            if (entries[i].size() == 0) {
-                entries[i][i] = 1;
-                b[i] = x[i];
-            }
-            if (fixed_dim[i]) {
-                b[i] = x[i];
-                entries[i].clear();
-                entries[i][i] = 1;
-            } else {
-                std::unordered_map<int, double> newmap;
-                for (auto& rec : entries[i]) {
-                    if (fixed_dim[rec.first]) {
-                        b[i] -= rec.second * x[rec.first];
+            for (int ii = 0; ii < 4; ++ii) {
+                int row = vid[ii];
+                if (fixed_dim[row]) continue;
+                // RHS contribution
+                rhs(row) += weights[ii].dot(C);
+                for (int jj = 0; jj < 4; ++jj) {
+                    int col = vid[jj];
+                    double val = weights[ii].dot(weights[jj]);
+                    if (fixed_dim[col]) {
+                        // Move fixed column contribution to RHS
+                        rhs(row) -= val * x[col];
                     } else {
-                        newmap[rec.first] = rec.second;
+                        int pos = edge_csr_pos[ei][ii * 4 + jj];
+                        if (pos >= 0) csr_val[pos] += val;
                     }
                 }
-                std::swap(entries[i], newmap);
-            }
-        }
-        std::vector<Eigen::Triplet<double>> lhsTriplets;
-        lhsTriplets.reserve(F_compact.size() * 8);
-        Eigen::SparseMatrix<double> A(O_compact.size() * 2, O_compact.size() * 2);
-        VectorXd rhs(O_compact.size() * 2);
-        rhs.setZero();
-        for (int i = 0; i < entries.size(); ++i) {
-            rhs(i) = b[i];
-            for (auto& rec : entries[i]) {
-                lhsTriplets.push_back(Eigen::Triplet<double>(i, rec.first, rec.second));
             }
         }
 
-        A.setFromTriplets(lhsTriplets.begin(), lhsTriplets.end());
+        // Set fixed and empty row diagonals
+        for (int i = 0; i < dim; ++i) {
+            if (fixed_dim[i]) {
+                if (diag_pos[i] >= 0) csr_val[diag_pos[i]] = 1.0;
+                rhs(i) = x[i];
+            } else if (!row_has_entry[i]) {
+                if (diag_pos[i] >= 0) csr_val[diag_pos[i]] = 1.0;
+                rhs(i) = x[i];
+            }
+        }
+
+        int _t4 = GetCurrentTime64();
 
 #ifdef LOG_OUTPUT
         int t1 = GetCurrentTime64();
 #endif
 
-        // FIXME: IncompleteCholesky Preconditioner will fail here so I fallback to Diagonal one.
-        // I suspected either there is a implementation bug in IncompleteCholesky Preconditioner
-        // or there is a memory corruption somewhere.  However, g++'s address sanitizer does not
-        // report anything useful.
-        LinearSolver<Eigen::SparseMatrix<double>> solver;
-        solver.analyzePattern(A);
-        solver.factorize(A);
-        //        Eigen::setNbThreads(1);
-        //        ConjugateGradient<SparseMatrix<double>, Lower | Upper> solver;
-        //        VectorXd x0 = VectorXd::Map(x.data(), x.size());
-        //        solver.setMaxIterations(40);
-
-        //        solver.compute(A);
-        VectorXd x_new = solver.solve(rhs);  // solver.solveWithGuess(rhs, x0);
+        VectorXd x_new;
+        x_new.resize(dim);
+#ifdef WITH_CUDA
+        {
+            if (!pcg_ctx) {
+                pcg_ctx = cuda_pcg_init(dim, csr_nnz,
+                    csr_rowPtr.data(), csr_colInd.data(), csr_val.data());
+                int ret = cuda_pcg_solve(pcg_ctx, csr_val.data(), rhs.data(), x_new.data());
+                if (ret != 0) {
+                    cuda_pcg_destroy(pcg_ctx); pcg_ctx = nullptr;
+                    Eigen::SparseMatrix<double, Eigen::RowMajor> A(dim, dim);
+                    // fallback: rebuild from triplets
+                    std::vector<Eigen::Triplet<double>> trips;
+                    for (int i = 0; i < dim; ++i)
+                        for (int j = csr_rowPtr[i]; j < csr_rowPtr[i+1]; ++j)
+                            trips.push_back(Eigen::Triplet<double>(i, csr_colInd[j], csr_val[j]));
+                    A.setFromTriplets(trips.begin(), trips.end());
+                    LinearSolver<Eigen::SparseMatrix<double>> solver;
+                    solver.analyzePattern(A); solver.factorize(A);
+                    x_new = solver.solve(rhs);
+                }
+            } else {
+                int ret = cuda_pcg_solve(pcg_ctx, csr_val.data(), rhs.data(), x_new.data());
+                if (ret != 0) {
+                    Eigen::SparseMatrix<double, Eigen::RowMajor> A(dim, dim);
+                    std::vector<Eigen::Triplet<double>> trips;
+                    for (int i = 0; i < dim; ++i)
+                        for (int j = csr_rowPtr[i]; j < csr_rowPtr[i+1]; ++j)
+                            trips.push_back(Eigen::Triplet<double>(i, csr_colInd[j], csr_val[j]));
+                    A.setFromTriplets(trips.begin(), trips.end());
+                    LinearSolver<Eigen::SparseMatrix<double>> solver;
+                    solver.analyzePattern(A); solver.factorize(A);
+                    x_new = solver.solve(rhs);
+                }
+            }
+        }
+#else
+        {
+            Eigen::SparseMatrix<double, Eigen::RowMajor> A(dim, dim);
+            std::vector<Eigen::Triplet<double>> trips;
+            for (int i = 0; i < dim; ++i)
+                for (int j = csr_rowPtr[i]; j < csr_rowPtr[i+1]; ++j)
+                    trips.push_back(Eigen::Triplet<double>(i, csr_colInd[j], csr_val[j]));
+            A.setFromTriplets(trips.begin(), trips.end());
+            LinearSolver<Eigen::SparseMatrix<double>> solver;
+            solver.analyzePattern(A);
+            solver.factorize(A);
+            x_new = solver.solve(rhs);
+        }
+#endif
 
 #ifdef LOG_OUTPUT
-        // std::cout << "[LSQ] n_iteration:" << solver.iterations() << std::endl;
-        // std::cout << "[LSQ] estimated error:" << solver.error() << std::endl;
         int t2 = GetCurrentTime64();
-        printf("[LSQ] Linear solver uses %lf seconds.\n", (t2 - t1) * 1e-3);
+        printf("[DYN iter=%d] FindNearest=%.0f ComputeDist=%.0f setup=%.0f fillCSR=%.0f solve=%.0f ms\n",
+               iter, (_t1-_t0)*1.0, (_t2-_t1)*1.0, (_t3-_t2)*1.0, (_t4-_t3)*1.0, (t2-t1)*1.0);
 #endif
         for (int i = 0; i < O_compact.size(); ++i) {
             // Vector3d q = Q.col(Vind[i]);
@@ -728,6 +870,9 @@ void Optimizer::optimize_positions_dynamic(
             }
         }
     }
+#ifdef WITH_CUDA
+    if (pcg_ctx) cuda_pcg_destroy(pcg_ctx);
+#endif
 }
 
 void Optimizer::optimize_positions_sharp(
@@ -1056,8 +1201,13 @@ void Optimizer::optimize_positions_fixed(
         }
     }
 
-    std::vector<std::unordered_map<int, double>> entries(num * 2);
-    std::vector<double> b(num * 2);
+    int dim2 = num * 2;
+    std::vector<double> b(dim2, 0.0);
+
+    // Build triplets directly — Eigen sums duplicates in setFromTriplets.
+    std::vector<Eigen::Triplet<double>> lhsTriplets;
+    lhsTriplets.reserve(F.cols() * 16);
+    std::vector<bool> row_has_entry(dim2, false);
 
     for (int m = 0; m < num; ++m) {
         int v1 = v_index[m];
@@ -1084,21 +1234,18 @@ void Optimizer::optimize_positions_fixed(
             double lambda = 1;
             if (sharp_vertices.count(v1) && sharp_vertices.count(v2)) lambda = 1;
             for (int i = 0; i < 4; ++i) {
+                row_has_entry[vid[i]] = true;
                 for (int j = 0; j < 4; ++j) {
-                    auto it = entries[vid[i]].find(vid[j]);
-                    if (it == entries[vid[i]].end()) {
-                        entries[vid[i]][vid[j]] = weights[i].dot(weights[j]) * lambda;
-                    } else {
-                        entries[vid[i]][vid[j]] += weights[i].dot(weights[j]) * lambda;
-                    }
+                    lhsTriplets.push_back(Eigen::Triplet<double>(
+                        vid[i], vid[j], weights[i].dot(weights[j]) * lambda));
                 }
                 b[vid[i]] += weights[i].dot(dis) * lambda;
             }
         }
     }
 
-    std::vector<int> fixed_dim(num * 2, 0);
-    std::vector<double> x(num * 2);
+    std::vector<int> fixed_dim(dim2, 0);
+    std::vector<double> x(dim2);
 #ifdef WITH_OMP
 #pragma omp parallel for
 #endif
@@ -1120,86 +1267,84 @@ void Optimizer::optimize_positions_fixed(
         x[i * 2 + 1] = (v_positions[i] - V.col(p)).dot(q_y);
     }
 
-    // fix sharp edges
-    for (int i = 0; i < entries.size(); ++i) {
-        if (fixed_dim[i]) {
-            b[i] = x[i];
-            entries[i].clear();
-            entries[i][i] = 1;
-        } else {
-            std::unordered_map<int, double> newmap;
-            for (auto& rec : entries[i]) {
-                if (fixed_dim[rec.first]) {
-                    b[i] -= rec.second * x[rec.first];
-                } else {
-                    newmap[rec.first] = rec.second;
-                }
-            }
-            std::swap(entries[i], newmap);
-        }
-    }
-    for (int i = 0; i < entries.size(); ++i) {
-        if (entries[i].size() == 0) {
-            entries[i][i] = 1;
+    // Add diagonal entries for empty rows
+    for (int i = 0; i < dim2; ++i) {
+        if (!row_has_entry[i]) {
+            lhsTriplets.push_back(Eigen::Triplet<double>(i, i, 1.0));
         }
     }
 
-    std::vector<Eigen::Triplet<double>> lhsTriplets;
-    lhsTriplets.reserve(F.cols() * 6);
-    Eigen::SparseMatrix<double> A(num * 2, num * 2);
-    VectorXd rhs(num * 2);
-    rhs.setZero();
-    for (int i = 0; i < entries.size(); ++i) {
-        rhs(i) = b[i];
-        if (std::isnan(b[i])) {
-            printf("Equation has nan!\n");
-            //exit(0);
-            throw std::runtime_error("Failed: qflow::Hierarchy::optimize_positions_fixed. Equation has nan! (1)");
-        }
-        for (auto& rec : entries[i]) {
-            lhsTriplets.push_back(Eigen::Triplet<double>(i, rec.first, rec.second));
-            if (std::isnan(rec.second)) {
-                printf("Equation has nan!\n");
-                //exit(0);
-                throw std::runtime_error("Failed: qflow::Hierarchy::optimize_positions_fixed. Equation has nan! (2)");
+    // Build sparse matrix (Eigen sums duplicate triplets)
+    Eigen::SparseMatrix<double> A(dim2, dim2);
+    A.setFromTriplets(lhsTriplets.begin(), lhsTriplets.end());
+
+    // Eliminate fixed dimensions
+    VectorXd rhs = VectorXd::Map(b.data(), dim2);
+    {
+        std::vector<Eigen::Triplet<double>> fixedTriplets;
+        fixedTriplets.reserve(lhsTriplets.size());
+        for (int col = 0; col < A.outerSize(); ++col) {
+            for (Eigen::SparseMatrix<double>::InnerIterator it(A, col); it; ++it) {
+                int r = it.row();
+                int c = it.col();
+                if (fixed_dim[r]) {
+                    if (r == c) fixedTriplets.push_back(Eigen::Triplet<double>(r, c, 1.0));
+                } else if (fixed_dim[c]) {
+                    rhs(r) -= it.value() * x[c];
+                } else {
+                    fixedTriplets.push_back(Eigen::Triplet<double>(r, c, it.value()));
+                }
             }
         }
+        for (int i = 0; i < dim2; ++i) {
+            if (fixed_dim[i]) rhs(i) = x[i];
+        }
+        A.setZero();
+        A.setFromTriplets(fixedTriplets.begin(), fixedTriplets.end());
     }
-    A.setFromTriplets(lhsTriplets.begin(), lhsTriplets.end());
+
+    // NaN check
+    for (int i = 0; i < dim2; ++i) {
+        if (std::isnan(rhs(i))) {
+            throw std::runtime_error("Failed: qflow::Hierarchy::optimize_positions_fixed. Equation has nan!");
+        }
+    }
 
 #ifdef LOG_OUTPUT
     int t1 = GetCurrentTime64();
 #endif
-    /*
-        Eigen::setNbThreads(1);
-        ConjugateGradient<SparseMatrix<double>, Lower | Upper> solver;
-        VectorXd x0 = VectorXd::Map(x.data(), x.size());
-        solver.setMaxIterations(40);
-
-        solver.compute(A);
-     */
-    LinearSolver<Eigen::SparseMatrix<double>> solver;
-    solver.analyzePattern(A);
-    solver.factorize(A);
-
-    VectorXd x_new = solver.solve(rhs);
+    VectorXd x_new;
+#ifdef WITH_CUDA
+    {
+        Eigen::SparseMatrix<double, Eigen::RowMajor> A_csr(A);
+        int n = A_csr.rows();
+        int nnz = A_csr.nonZeros();
+        x_new.resize(n);
+        int ret = cuda_cholesky_solve(n, nnz,
+            A_csr.outerIndexPtr(), A_csr.innerIndexPtr(), A_csr.valuePtr(),
+            rhs.data(), x_new.data());
+        if (ret != 0) {
+            LinearSolver<Eigen::SparseMatrix<double>> solver;
+            solver.analyzePattern(A);
+            solver.factorize(A);
+            x_new = solver.solve(rhs);
+        }
+    }
+#else
+    {
+        LinearSolver<Eigen::SparseMatrix<double>> solver;
+        solver.analyzePattern(A);
+        solver.factorize(A);
+        x_new = solver.solve(rhs);
+    }
+#endif
 #ifdef LOG_OUTPUT
-    // std::cout << "[LSQ] n_iteration:" << solver.iterations() << std::endl;
-    // std::cout << "[LSQ] estimated error:" << solver.error() << std::endl;
     int t2 = GetCurrentTime64();
     printf("[LSQ] Linear solver uses %lf seconds.\n", (t2 - t1) * 1e-3);
 #endif
 
     for (int i = 0; i < x.size(); ++i) {
         if (!std::isnan(x_new[i])) {
-            if (!fixed_dim[i / 2 * 2 + 1]) {
-                double total = 0;
-                for (auto& res : entries[i]) {
-                    double t = x_new[res.first];
-                    if (std::isnan(t)) t = 0;
-                    total += t * res.second;
-                }
-            }
             x[i] = x_new[i];
         }
     }
@@ -1229,84 +1374,125 @@ void Optimizer::optimize_integer_constraints(Hierarchy& mRes, std::map<int, int>
         auto& F2E = mRes.mF2E[level];
         auto& E2F = mRes.mE2F[level];
 
-        int iter = 0;
-        while (!fullFlow) {
-            std::vector<Vector4i> edge_to_constraints(E2F.size() * 2, Vector4i(-1, 0, -1, 0));
-            std::vector<int> initial(F2E.size() * 2, 0);
-            for (int i = 0; i < F2E.size(); ++i) {
-                for (int j = 0; j < 3; ++j) {
-                    int e = F2E[i][j];
-                    Vector2i index = rshift90(Vector2i(e * 2 + 1, e * 2 + 2), FQ[i][j]);
-                    for (int k = 0; k < 2; ++k) {
-                        int l = abs(index[k]);
-                        int s = index[k] / l;
-                        int ind = l - 1;
-                        int equationID = i * 2 + k;
-                        if (edge_to_constraints[ind][0] == -1) {
-                            edge_to_constraints[ind][0] = equationID;
-                            edge_to_constraints[ind][1] = s;
-                        } else {
-                            edge_to_constraints[ind][2] = equationID;
-                            edge_to_constraints[ind][3] = s;
-                        }
-                        initial[equationID] += s * EdgeDiff[ind / 2][ind % 2];
+        // === Topology building (constant across while-loop iterations) ===
+        unsigned long long t_topo = GetCurrentTime64();
+        std::vector<Vector4i> edge_to_constraints(E2F.size() * 2, Vector4i(-1, 0, -1, 0));
+        // Precompute initial[] contribution list: (equationID, sign, edge_var_index)
+        struct InitContrib { int equationID; int sign; int edge_var; };
+        std::vector<InitContrib> init_contribs;
+        init_contribs.reserve(F2E.size() * 6);  // 3 edges × 2 components per face
+        for (int i = 0; i < (int)F2E.size(); ++i) {
+            for (int j = 0; j < 3; ++j) {
+                int e = F2E[i][j];
+                Vector2i index = rshift90(Vector2i(e * 2 + 1, e * 2 + 2), FQ[i][j]);
+                for (int k = 0; k < 2; ++k) {
+                    int l = abs(index[k]);
+                    int s = index[k] / l;
+                    int ind = l - 1;
+                    int equationID = i * 2 + k;
+                    if (edge_to_constraints[ind][0] == -1) {
+                        edge_to_constraints[ind][0] = equationID;
+                        edge_to_constraints[ind][1] = s;
+                    } else {
+                        edge_to_constraints[ind][2] = equationID;
+                        edge_to_constraints[ind][3] = s;
                     }
+                    init_contribs.push_back({equationID, s, ind});
                 }
             }
+        }
+        // Build arc topology (v1, v2, edge_var_index, allow_change_type)
+        struct ArcTopo { int v1, v2, edge_var; int arc_id; };
+        std::vector<ArcTopo> arc_topos;
+        arc_topos.reserve(edge_to_constraints.size() / 2);
+        for (int i = 0; i < (int)edge_to_constraints.size(); ++i) {
+            if (AllowChange[level][i] == 0) continue;
+            if (edge_to_constraints[i][0] == -1 || edge_to_constraints[i][2] == -1) continue;
+            if (edge_to_constraints[i][1] == -edge_to_constraints[i][3]) {
+                int v1 = edge_to_constraints[i][0];
+                int v2 = edge_to_constraints[i][2];
+                if (edge_to_constraints[i][1] < 0) std::swap(v1, v2);
+                int aid = (AllowChange[level][i] == 1) ? (i + 1) : -(i + 1);
+                arc_topos.push_back({v1, v2, i, aid});
+            }
+        }
+        int num_equations = (int)F2E.size() * 2;
+        printf("[TIMING]       topology setup: %lf s\n", (GetCurrentTime64() - t_topo) * 1e-3);
+
+        int iter = 0;
+        while (!fullFlow) {
+            unsigned long long t_setup = GetCurrentTime64();
+            // Recompute initial[] from current EdgeDiff
+            std::vector<int> initial(num_equations, 0);
+            for (auto& c : init_contribs) {
+                initial[c.equationID] += c.sign * EdgeDiff[c.edge_var / 2][c.edge_var % 2];
+            }
+            // Build arcs with current capacities + supply/demand
             std::vector<std::pair<Vector2i, int>> arcs;
             std::vector<int> arc_ids;
-            for (int i = 0; i < edge_to_constraints.size(); ++i) {
-                if (AllowChange[level][i] == 0) continue;
-                if (edge_to_constraints[i][0] == -1 || edge_to_constraints[i][2] == -1) continue;
-                if (edge_to_constraints[i][1] == -edge_to_constraints[i][3]) {
-                    int v1 = edge_to_constraints[i][0];
-                    int v2 = edge_to_constraints[i][2];
-                    if (edge_to_constraints[i][1] < 0) std::swap(v1, v2);
-                    int current_v = EdgeDiff[i / 2][i % 2];
-                    arcs.push_back(std::make_pair(Vector2i(v1, v2), current_v));
-                    if (AllowChange[level][i] == 1)
-                        arc_ids.push_back(i + 1);
-                    else {
-                        arc_ids.push_back(-(i + 1));
-                    }
-                }
+            arcs.reserve(arc_topos.size() + num_equations);
+            arc_ids.reserve(arc_topos.size());
+            for (auto& at : arc_topos) {
+                int current_v = EdgeDiff[at.edge_var / 2][at.edge_var % 2];
+                arcs.push_back(std::make_pair(Vector2i(at.v1, at.v2), current_v));
+                arc_ids.push_back(at.arc_id);
             }
             int supply = 0;
             int demand = 0;
-            for (int i = 0; i < initial.size(); ++i) {
+            for (int i = 0; i < num_equations; ++i) {
                 int init_val = initial[i];
                 if (init_val > 0) {
                     arcs.push_back(std::make_pair(Vector2i(-1, i), initial[i]));
                     supply += init_val;
                 } else if (init_val < 0) {
                     demand -= init_val;
-                    arcs.push_back(std::make_pair(Vector2i(i, initial.size()), -init_val));
+                    arcs.push_back(std::make_pair(Vector2i(i, num_equations), -init_val));
                 }
             }
 
             std::unique_ptr<MaxFlowHelper> solver = nullptr;
-            if (use_minimum_cost_flow && level == mRes.mToUpperEdges.size()) {
+            if (use_minimum_cost_flow && level == (int)mRes.mToUpperEdges.size()) {
                 lprintf("network simplex MCF is used\n");
+                printf("[TIMING]     solver=NetworkSimplex level=%d arcs=%zu supply=%d\n", level, arcs.size(), supply);
                 solver = std::make_unique<NetworkSimplexFlowHelper>();
             } else if (supply < 20) {
+                printf("[TIMING]     solver=ECMaxFlow level=%d arcs=%zu supply=%d\n", level, arcs.size(), supply);
                 solver = std::make_unique<ECMaxFlowHelper>();
             } else {
-                solver = std::make_unique<BoykovMaxFlowHelper>();
+                const char* flow_env = getenv("QUADRIFLOW_SOLVER");
+                std::string flow_solver = flow_env ? flow_env : "boykov";
+                if (flow_solver == "lemon") {
+                    printf("[TIMING]     solver=LemonPreflow level=%d arcs=%zu supply=%d\n", level, arcs.size(), supply);
+                    solver = std::make_unique<LemonPreflowHelper>();
+                } else if (flow_solver == "pushrelabel") {
+                    printf("[TIMING]     solver=PushRelabel level=%d arcs=%zu supply=%d\n", level, arcs.size(), supply);
+                    solver = std::make_unique<PushRelabelMaxFlowHelper>();
+#ifdef WITH_CUDA
+                } else if (flow_solver == "cuda") {
+                    printf("[TIMING]     solver=CudaMaxFlow level=%d arcs=%zu supply=%d\n", level, arcs.size(), supply);
+                    solver = std::make_unique<CudaMaxFlowHelper>();
+#endif
+                } else {
+                    printf("[TIMING]     solver=BoykovMaxFlow level=%d arcs=%zu supply=%d\n", level, arcs.size(), supply);
+                    solver = std::make_unique<BoykovMaxFlowHelper>();
+                }
             }
 
 #ifdef WITH_GUROBI
-            if (use_minimum_cost_flow && level == mRes.mToUpperEdges.size()) {
+            if (use_minimum_cost_flow && level == (int)mRes.mToUpperEdges.size()) {
                 solver = std::make_unique<GurobiFlowHelper>();
             }
 #endif
+            printf("[TIMING]       arc setup: %lf s\n", (GetCurrentTime64() - t_setup) * 1e-3);
+            unsigned long long t_addedge = GetCurrentTime64();
+
             solver->resize(initial.size() + 2, arc_ids.size());
 
-            std::set<int> ids;
-            for (int i = 0; i < arcs.size(); ++i) {
+            for (int i = 0; i < (int)arcs.size(); ++i) {
                 int v1 = arcs[i].first[0] + 1;
                 int v2 = arcs[i].first[1] + 1;
                 int c = arcs[i].second;
-                if (v1 == 0 || v2 == initial.size() + 1) {
+                if (v1 == 0 || v2 == (int)initial.size() + 1) {
                     solver->addEdge(v1, v2, c, 0, -1);
                 } else {
                     if (arc_ids[i] > 0)
@@ -1322,7 +1508,10 @@ void Optimizer::optimize_integer_constraints(Hierarchy& mRes, std::map<int, int>
                     }
                 }
             }
+            printf("[TIMING]       addEdge: %lf s\n", (GetCurrentTime64() - t_addedge) * 1e-3);
+            unsigned long long t_solve = GetCurrentTime64();
             int flow_count = solver->compute();
+            printf("[TIMING]     flow solver->compute() level=%d: %lf s\n", level, (GetCurrentTime64() - t_solve) * 1e-3);
 
             solver->applyTo(EdgeDiff);
 

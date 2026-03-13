@@ -1,6 +1,8 @@
 #include <glm/glm.hpp>
 #include <cuda_runtime.h>
-#include "AdjacentMatrix.h"
+#include "adjacent-matrix.hpp"
+
+using namespace qflow;
 
 __device__ __host__ glm::dvec3
 middle_point(const glm::dvec3 &p0, const glm::dvec3 &n0, const glm::dvec3 &p1, const glm::dvec3 &n1) {
@@ -34,8 +36,8 @@ double scale) {
 	glm::dvec3 t = glm::cross(n, q);
 	glm::dvec3 d = p - o;
 	return o +
-		q * std::round(glm::dot(q, d) * inv_scale) * scale +
-		t * std::round(glm::dot(t, d) * inv_scale) * scale;
+		q * round(glm::dot(q, d) * inv_scale) * scale +
+		t * round(glm::dot(t, d) * inv_scale) * scale;
 }
 
 __device__ __host__ glm::dvec3
@@ -46,13 +48,13 @@ double scale) {
 	glm::dvec3 t = glm::cross(n,q);
 	glm::dvec3 d = p - o;
 	return o +
-		q * std::floor(glm::dot(q, d) * inv_scale) * scale +
-		t * std::floor(glm::dot(t, d) * inv_scale) * scale;
+		q * floor(glm::dot(q, d) * inv_scale) * scale +
+		t * floor(glm::dot(t, d) * inv_scale) * scale;
 }
 
 
 __device__ __host__ double cudaSignum(double value) {
-	return std::copysign((double)1, value);
+	return copysign(1.0, value);
 }
 
 __device__ __host__ void
@@ -66,7 +68,7 @@ const glm::dvec3 &q1, const glm::dvec3 &n1, glm::dvec3& value1, glm::dvec3& valu
 
 	for (int i = 0; i < 2; ++i) {
 		for (int j = 0; j < 2; ++j) {
-			double score = std::abs(glm::dot(A[i], B[j]));
+			double score = fabs(glm::dot(A[i], B[j]));
 			if (score > best_score + 1e-6) {
 				best_a = i;
 				best_b = j;
@@ -254,6 +256,8 @@ void cudaPropagatePositionUpper(glm::dvec3* srcField, glm::ivec2* toUpper, glm::
 }
 
 
+namespace qflow {
+
 void UpdateOrientation(int* phase, int num_phases, glm::dvec3* N, glm::dvec3* Q, Link* adj, int* adjOffset, int num_adj) {
 	cudaUpdateOrientation << <(num_phases + 255) / 256, 256 >> >(phase, num_phases, N, Q, adj, adjOffset, num_adj);
 //	cudaUpdateOrientation(phase, num_phases, N, Q, adj, adjOffset, num_adj);
@@ -278,4 +282,384 @@ void UpdatePosition(int* phase, int num_phases, glm::dvec3* N, glm::dvec3* Q, Li
 void PropagatePositionUpper(glm::dvec3* srcField, int num_position, glm::ivec2* toUpper, glm::dvec3* N, glm::dvec3* V, glm::dvec3* destField) {
 	cudaPropagatePositionUpper << <(num_position + 255) / 256, 256 >> >(srcField, toUpper, N, V, destField, num_position);
 //	cudaPropagatePositionUpper(srcField, toUpper, N, V, destField, num_position);
+}
+
+} // namespace qflow
+
+// GPU sort for DownsampleGraph edge entries using Thrust
+#include <thrust/device_vector.h>
+#include <thrust/sort.h>
+
+struct GpuSortEntry {
+    int i, j;
+    double order;
+};
+
+struct GpuSortComp {
+    __host__ __device__
+    bool operator()(const GpuSortEntry& a, const GpuSortEntry& b) const {
+        return a.order > b.order;  // descending by order (matches Entry::operator<)
+    }
+};
+
+extern "C" void cuda_sort_entries(void* data, int count) {
+    GpuSortEntry* entries = (GpuSortEntry*)data;
+    thrust::device_vector<GpuSortEntry> d_entries(entries, entries + count);
+    thrust::sort(d_entries.begin(), d_entries.end(), GpuSortComp());
+    thrust::copy(d_entries.begin(), d_entries.end(), entries);
+}
+
+// GPU IC0-Preconditioned Conjugate Gradient solver
+#include <cusparse.h>
+
+// Custom kernels for CG vector operations
+__global__ void pcg_dot_partial(const double* a, const double* b, double* partial, int n) {
+    extern __shared__ double sdata[];
+    int tid = threadIdx.x;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    sdata[tid] = (i < n) ? a[i] * b[i] : 0.0;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) partial[blockIdx.x] = sdata[0];
+}
+
+__global__ void pcg_dot_final(const double* partial, double* result, int nBlocks) {
+    extern __shared__ double sdata[];
+    int tid = threadIdx.x;
+    sdata[tid] = (tid < nBlocks) ? partial[tid] : 0.0;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    if (tid == 0) result[0] = sdata[0];
+}
+
+__global__ void pcg_update_xr(double* x, double* r, const double* p,
+                               const double* Ap, double alpha, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    x[i] += alpha * p[i];
+    r[i] -= alpha * Ap[i];
+}
+
+__global__ void pcg_update_p(double* p, const double* z, double beta, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    p[i] = z[i] + beta * p[i];
+}
+
+__global__ void pcg_copy(double* dst, const double* src, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    dst[i] = src[i];
+}
+
+static double gpu_dot(const double* a, const double* b, int n,
+                      double* d_partial, double* d_result, double* h_result) {
+    int blockSize = 256;
+    int nBlocks = (n + blockSize - 1) / blockSize;
+    pcg_dot_partial<<<nBlocks, blockSize, blockSize * sizeof(double)>>>(a, b, d_partial, n);
+    int finalBlock = 1;
+    while (finalBlock < nBlocks) finalBlock <<= 1;
+    if (finalBlock > 1024) finalBlock = 1024;
+    pcg_dot_final<<<1, finalBlock, finalBlock * sizeof(double)>>>(d_partial, d_result, nBlocks);
+    cudaMemcpy(h_result, d_result, sizeof(double), cudaMemcpyDeviceToHost);
+    return *h_result;
+}
+
+// SpMV: y = A*x using custom kernel
+__global__ void pcg_spmv(const int* rowPtr, const int* colInd,
+                          const double* val, const double* x, double* y, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    double sum = 0.0;
+    for (int j = rowPtr[i]; j < rowPtr[i + 1]; j++) {
+        sum += val[j] * x[colInd[j]];
+    }
+    y[i] = sum;
+}
+
+// Persistent PCG solver context — reuses GPU buffers and IC0 analysis across solves
+struct PcgContext {
+    int n, nnz, nBlocks;
+    int *d_rowPtr, *d_colInd;
+    double *d_val, *d_ic_val, *d_b, *d_x;
+    double *d_r, *d_z, *d_p, *d_Ap, *d_tmp;
+    double *d_partial, *d_result;
+    cusparseHandle_t spHandle;
+    cusparseMatDescr_t descrA;
+    csric02Info_t ic0Info;
+    void* d_ic0Buf;
+    int ic0BufSize;
+    bool ic0_ok;
+    // SpSV descriptors for triangular solves
+    cusparseSpMatDescr_t matL;
+    cusparseDnVecDescr_t vecIn, vecTmp, vecOut;
+    cusparseSpSVDescr_t spsvDescrL, spsvDescrLt;
+    void *d_bufSvL, *d_bufSvLt;
+    bool initialized;
+};
+
+extern "C" void* cuda_pcg_init(
+    int n, int nnz,
+    const int* h_csrRowPtr,
+    const int* h_csrColInd,
+    const double* h_csrVal  // initial values for IC0 analysis
+) {
+    PcgContext* ctx = new PcgContext();
+    ctx->n = n;
+    ctx->nnz = nnz;
+    ctx->nBlocks = (n + 255) / 256;
+    ctx->ic0_ok = false;
+    ctx->matL = nullptr;
+    ctx->vecIn = ctx->vecTmp = ctx->vecOut = nullptr;
+    ctx->spsvDescrL = ctx->spsvDescrLt = nullptr;
+    ctx->d_bufSvL = ctx->d_bufSvLt = nullptr;
+    ctx->initialized = true;
+
+    int nBlocks = ctx->nBlocks;
+
+    // Allocate all GPU buffers once
+    cudaMalloc(&ctx->d_rowPtr, (n + 1) * sizeof(int));
+    cudaMalloc(&ctx->d_colInd, nnz * sizeof(int));
+    cudaMalloc(&ctx->d_val, nnz * sizeof(double));
+    cudaMalloc(&ctx->d_ic_val, nnz * sizeof(double));
+    cudaMalloc(&ctx->d_b, n * sizeof(double));
+    cudaMalloc(&ctx->d_x, n * sizeof(double));
+    cudaMalloc(&ctx->d_r, n * sizeof(double));
+    cudaMalloc(&ctx->d_z, n * sizeof(double));
+    cudaMalloc(&ctx->d_p, n * sizeof(double));
+    cudaMalloc(&ctx->d_Ap, n * sizeof(double));
+    cudaMalloc(&ctx->d_tmp, n * sizeof(double));
+    cudaMalloc(&ctx->d_partial, nBlocks * sizeof(double));
+    cudaMalloc(&ctx->d_result, sizeof(double));
+
+    // Upload structure (once — pattern doesn't change)
+    cudaMemcpy(ctx->d_rowPtr, h_csrRowPtr, (n + 1) * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(ctx->d_colInd, h_csrColInd, nnz * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(ctx->d_val, h_csrVal, nnz * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(ctx->d_ic_val, h_csrVal, nnz * sizeof(double), cudaMemcpyHostToDevice);
+
+    // cuSPARSE handle + descriptor
+    cusparseCreate(&ctx->spHandle);
+    cusparseCreateMatDescr(&ctx->descrA);
+    cusparseSetMatType(ctx->descrA, CUSPARSE_MATRIX_TYPE_GENERAL);
+    cusparseSetMatIndexBase(ctx->descrA, CUSPARSE_INDEX_BASE_ZERO);
+
+    // IC0 symbolic analysis (once — depends only on sparsity pattern)
+#pragma nv_diag_suppress 1444
+    cusparseCreateCsric02Info(&ctx->ic0Info);
+    cusparseDcsric02_bufferSize(ctx->spHandle, n, nnz, ctx->descrA,
+        ctx->d_ic_val, ctx->d_rowPtr, ctx->d_colInd, ctx->ic0Info, &ctx->ic0BufSize);
+    cudaMalloc(&ctx->d_ic0Buf, ctx->ic0BufSize);
+    cusparseDcsric02_analysis(ctx->spHandle, n, nnz, ctx->descrA,
+        ctx->d_ic_val, ctx->d_rowPtr, ctx->d_colInd, ctx->ic0Info,
+        CUSPARSE_SOLVE_POLICY_USE_LEVEL, ctx->d_ic0Buf);
+
+    int structural_zero;
+    cusparseStatus_t st = cusparseXcsric02_zeroPivot(ctx->spHandle, ctx->ic0Info, &structural_zero);
+    ctx->ic0_ok = (st != CUSPARSE_STATUS_ZERO_PIVOT);
+    if (!ctx->ic0_ok) {
+        printf("[PCG-IC0] structural zero at row %d, no IC0\n", structural_zero);
+    }
+
+    // Do initial numeric IC0 factorization
+    if (ctx->ic0_ok) {
+        cusparseDcsric02(ctx->spHandle, n, nnz, ctx->descrA,
+            ctx->d_ic_val, ctx->d_rowPtr, ctx->d_colInd, ctx->ic0Info,
+            CUSPARSE_SOLVE_POLICY_USE_LEVEL, ctx->d_ic0Buf);
+        cusparseStatus_t ns = cusparseXcsric02_zeroPivot(ctx->spHandle, ctx->ic0Info, &structural_zero);
+        if (ns == CUSPARSE_STATUS_ZERO_PIVOT) {
+            printf("[PCG-IC0] numerical zero at row %d, no IC0\n", structural_zero);
+            ctx->ic0_ok = false;
+        }
+    }
+
+    // Setup SpSV for triangular solves
+    if (ctx->ic0_ok) {
+        cusparseCreateCsr(&ctx->matL, n, n, nnz,
+            ctx->d_rowPtr, ctx->d_colInd, ctx->d_ic_val,
+            CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I, CUSPARSE_INDEX_BASE_ZERO, CUDA_R_64F);
+        cusparseFillMode_t fillMode = CUSPARSE_FILL_MODE_LOWER;
+        cusparseDiagType_t diagType = CUSPARSE_DIAG_TYPE_NON_UNIT;
+        cusparseSpMatSetAttribute(ctx->matL, CUSPARSE_SPMAT_FILL_MODE, &fillMode, sizeof(fillMode));
+        cusparseSpMatSetAttribute(ctx->matL, CUSPARSE_SPMAT_DIAG_TYPE, &diagType, sizeof(diagType));
+
+        cusparseCreateDnVec(&ctx->vecIn, n, ctx->d_r, CUDA_R_64F);
+        cusparseCreateDnVec(&ctx->vecTmp, n, ctx->d_tmp, CUDA_R_64F);
+        cusparseCreateDnVec(&ctx->vecOut, n, ctx->d_z, CUDA_R_64F);
+
+        double one = 1.0;
+        cusparseSpSV_createDescr(&ctx->spsvDescrL);
+        size_t bufSizeL;
+        cusparseSpSV_bufferSize(ctx->spHandle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+            &one, ctx->matL, ctx->vecIn, ctx->vecTmp, CUDA_R_64F,
+            CUSPARSE_SPSV_ALG_DEFAULT, ctx->spsvDescrL, &bufSizeL);
+        cudaMalloc(&ctx->d_bufSvL, bufSizeL);
+        cusparseSpSV_analysis(ctx->spHandle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+            &one, ctx->matL, ctx->vecIn, ctx->vecTmp, CUDA_R_64F,
+            CUSPARSE_SPSV_ALG_DEFAULT, ctx->spsvDescrL, ctx->d_bufSvL);
+
+        cusparseSpSV_createDescr(&ctx->spsvDescrLt);
+        size_t bufSizeLt;
+        cusparseSpSV_bufferSize(ctx->spHandle, CUSPARSE_OPERATION_TRANSPOSE,
+            &one, ctx->matL, ctx->vecTmp, ctx->vecOut, CUDA_R_64F,
+            CUSPARSE_SPSV_ALG_DEFAULT, ctx->spsvDescrLt, &bufSizeLt);
+        cudaMalloc(&ctx->d_bufSvLt, bufSizeLt);
+        cusparseSpSV_analysis(ctx->spHandle, CUSPARSE_OPERATION_TRANSPOSE,
+            &one, ctx->matL, ctx->vecTmp, ctx->vecOut, CUDA_R_64F,
+            CUSPARSE_SPSV_ALG_DEFAULT, ctx->spsvDescrLt, ctx->d_bufSvLt);
+    }
+
+    printf("[PCG-IC0] init: n=%d nnz=%d ic0=%s\n", n, nnz, ctx->ic0_ok ? "yes" : "no");
+    return (void*)ctx;
+}
+
+extern "C" int cuda_pcg_solve(
+    void* context,
+    const double* h_csrVal,  // new values (same pattern)
+    const double* h_b,
+    double* h_x
+) {
+    PcgContext* ctx = (PcgContext*)context;
+    int n = ctx->n, nnz = ctx->nnz;
+    const int MAX_ITER = 1000;
+    const double TOL = 1e-6;
+    const int BS = 256;
+    int nBlocks = ctx->nBlocks;
+
+    // Upload only values and RHS (pattern already on GPU)
+    cudaMemcpy(ctx->d_val, h_csrVal, nnz * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(ctx->d_b, h_b, n * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemset(ctx->d_x, 0, n * sizeof(double));
+
+    // Re-factorize IC0 with new values (reuse analysis)
+    if (ctx->ic0_ok) {
+        cudaMemcpy(ctx->d_ic_val, h_csrVal, nnz * sizeof(double), cudaMemcpyHostToDevice);
+#pragma nv_diag_suppress 1444
+        cusparseDcsric02(ctx->spHandle, n, nnz, ctx->descrA,
+            ctx->d_ic_val, ctx->d_rowPtr, ctx->d_colInd, ctx->ic0Info,
+            CUSPARSE_SOLVE_POLICY_USE_LEVEL, ctx->d_ic0Buf);
+        // Re-analyze SpSV with new factored values
+        double one = 1.0;
+        cusparseSpSV_destroyDescr(ctx->spsvDescrL);
+        cusparseSpSV_createDescr(&ctx->spsvDescrL);
+        cusparseSpSV_analysis(ctx->spHandle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+            &one, ctx->matL, ctx->vecIn, ctx->vecTmp, CUDA_R_64F,
+            CUSPARSE_SPSV_ALG_DEFAULT, ctx->spsvDescrL, ctx->d_bufSvL);
+        cusparseSpSV_destroyDescr(ctx->spsvDescrLt);
+        cusparseSpSV_createDescr(&ctx->spsvDescrLt);
+        cusparseSpSV_analysis(ctx->spHandle, CUSPARSE_OPERATION_TRANSPOSE,
+            &one, ctx->matL, ctx->vecTmp, ctx->vecOut, CUDA_R_64F,
+            CUSPARSE_SPSV_ALG_DEFAULT, ctx->spsvDescrLt, ctx->d_bufSvLt);
+    }
+
+    // CG iteration
+    pcg_copy<<<nBlocks, BS>>>(ctx->d_r, ctx->d_b, n);
+
+    if (ctx->ic0_ok) {
+        double one = 1.0;
+        cusparseDnVecSetValues(ctx->vecIn, ctx->d_r);
+        cusparseDnVecSetValues(ctx->vecTmp, ctx->d_tmp);
+        cusparseDnVecSetValues(ctx->vecOut, ctx->d_z);
+        cusparseSpSV_solve(ctx->spHandle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+            &one, ctx->matL, ctx->vecIn, ctx->vecTmp, CUDA_R_64F,
+            CUSPARSE_SPSV_ALG_DEFAULT, ctx->spsvDescrL);
+        cusparseSpSV_solve(ctx->spHandle, CUSPARSE_OPERATION_TRANSPOSE,
+            &one, ctx->matL, ctx->vecTmp, ctx->vecOut, CUDA_R_64F,
+            CUSPARSE_SPSV_ALG_DEFAULT, ctx->spsvDescrLt);
+    } else {
+        pcg_copy<<<nBlocks, BS>>>(ctx->d_z, ctx->d_r, n);
+    }
+
+    pcg_copy<<<nBlocks, BS>>>(ctx->d_p, ctx->d_z, n);
+
+    double h_result_val;
+    double rz_old = gpu_dot(ctx->d_r, ctx->d_z, n, ctx->d_partial, ctx->d_result, &h_result_val);
+    double r0_norm = gpu_dot(ctx->d_r, ctx->d_r, n, ctx->d_partial, ctx->d_result, &h_result_val);
+    double tol_sq = TOL * TOL * r0_norm;
+
+    int iter;
+    for (iter = 0; iter < MAX_ITER; iter++) {
+        pcg_spmv<<<nBlocks, BS>>>(ctx->d_rowPtr, ctx->d_colInd, ctx->d_val, ctx->d_p, ctx->d_Ap, n);
+
+        double pAp = gpu_dot(ctx->d_p, ctx->d_Ap, n, ctx->d_partial, ctx->d_result, &h_result_val);
+        if (fabs(pAp) < 1e-30) break;
+        double alpha = rz_old / pAp;
+
+        pcg_update_xr<<<nBlocks, BS>>>(ctx->d_x, ctx->d_r, ctx->d_p, ctx->d_Ap, alpha, n);
+
+        if ((iter & 15) == 0) {
+            double rr = gpu_dot(ctx->d_r, ctx->d_r, n, ctx->d_partial, ctx->d_result, &h_result_val);
+            if (rr < tol_sq) { iter++; break; }
+        }
+
+        if (ctx->ic0_ok) {
+            double one = 1.0;
+            cusparseDnVecSetValues(ctx->vecIn, ctx->d_r);
+            cusparseDnVecSetValues(ctx->vecTmp, ctx->d_tmp);
+            cusparseDnVecSetValues(ctx->vecOut, ctx->d_z);
+            cusparseSpSV_solve(ctx->spHandle, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                &one, ctx->matL, ctx->vecIn, ctx->vecTmp, CUDA_R_64F,
+                CUSPARSE_SPSV_ALG_DEFAULT, ctx->spsvDescrL);
+            cusparseSpSV_solve(ctx->spHandle, CUSPARSE_OPERATION_TRANSPOSE,
+                &one, ctx->matL, ctx->vecTmp, ctx->vecOut, CUDA_R_64F,
+                CUSPARSE_SPSV_ALG_DEFAULT, ctx->spsvDescrLt);
+        } else {
+            pcg_copy<<<nBlocks, BS>>>(ctx->d_z, ctx->d_r, n);
+        }
+
+        double rz_new = gpu_dot(ctx->d_r, ctx->d_z, n, ctx->d_partial, ctx->d_result, &h_result_val);
+        double beta = rz_new / rz_old;
+        rz_old = rz_new;
+        pcg_update_p<<<nBlocks, BS>>>(ctx->d_p, ctx->d_z, beta, n);
+    }
+
+    printf("[PCG-IC0] iters=%d\n", iter);
+    cudaMemcpy(h_x, ctx->d_x, n * sizeof(double), cudaMemcpyDeviceToHost);
+    return (iter < MAX_ITER) ? 0 : -1;
+}
+
+extern "C" void cuda_pcg_destroy(void* context) {
+    PcgContext* ctx = (PcgContext*)context;
+    if (!ctx) return;
+    if (ctx->spsvDescrL) cusparseSpSV_destroyDescr(ctx->spsvDescrL);
+    if (ctx->spsvDescrLt) cusparseSpSV_destroyDescr(ctx->spsvDescrLt);
+    if (ctx->matL) cusparseDestroySpMat(ctx->matL);
+    if (ctx->vecIn) cusparseDestroyDnVec(ctx->vecIn);
+    if (ctx->vecTmp) cusparseDestroyDnVec(ctx->vecTmp);
+    if (ctx->vecOut) cusparseDestroyDnVec(ctx->vecOut);
+    if (ctx->d_bufSvL) cudaFree(ctx->d_bufSvL);
+    if (ctx->d_bufSvLt) cudaFree(ctx->d_bufSvLt);
+#pragma nv_diag_suppress 1444
+    cusparseDestroyCsric02Info(ctx->ic0Info);
+    cudaFree(ctx->d_ic0Buf);
+    cusparseDestroyMatDescr(ctx->descrA);
+    cusparseDestroy(ctx->spHandle);
+    cudaFree(ctx->d_rowPtr); cudaFree(ctx->d_colInd);
+    cudaFree(ctx->d_val); cudaFree(ctx->d_ic_val);
+    cudaFree(ctx->d_b); cudaFree(ctx->d_x);
+    cudaFree(ctx->d_r); cudaFree(ctx->d_z);
+    cudaFree(ctx->d_p); cudaFree(ctx->d_Ap); cudaFree(ctx->d_tmp);
+    cudaFree(ctx->d_partial); cudaFree(ctx->d_result);
+    delete ctx;
+}
+
+// One-shot API for callers that don't need persistence (optimize_positions_fixed, optimize_scale)
+extern "C" int cuda_cholesky_solve(
+    int n, int nnz,
+    const int* h_csrRowPtr,
+    const int* h_csrColInd,
+    const double* h_csrVal,
+    const double* h_b,
+    double* h_x
+) {
+    void* ctx = cuda_pcg_init(n, nnz, h_csrRowPtr, h_csrColInd, h_csrVal);
+    int ret = cuda_pcg_solve(ctx, h_csrVal, h_b, h_x);
+    cuda_pcg_destroy(ctx);
+    return ret;
 }
