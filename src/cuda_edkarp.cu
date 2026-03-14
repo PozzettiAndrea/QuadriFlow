@@ -50,6 +50,15 @@ __global__ void k_ek_bfs_expand(
     }
 }
 
+// ---- Visited-bitmap BFS (smaller memset: 512KB vs 16MB) ----
+// Uses a separate visited[] array (int per node, could be byte).
+// memset(visited, 0, N*4) = 16MB — same as parent. Not helpful.
+// Actually we need a different approach entirely.
+
+// ---- Standalone GPU EK solver (optimized for full solve) ----
+// Used as flow strategy 3. Same as cuda_edmonds_karp_solve but
+// available from this compilation unit.
+
 // ---- Path trace + flow push (single thread, Edmonds-Karp) ----
 __global__ void k_ek_trace_push(
     const int* parent, const int* parent_edge, const int* parent_dir,
@@ -479,196 +488,249 @@ CudaMaxFlowResult cuda_dinic_solve(
     printf("[TIMING]       GPU Dinic phase: %d phases, %d paths, flow=%d\n",
            dinic_phases, total_paths, total_flow);
 
-    // Download flow after Dinic phase
-    cudaMemcpy(result.edge_flows.data(), d_flow, num_edges*sizeof(int), cudaMemcpyDeviceToHost);
-
-    // (debug save removed — use -save-all for checkpoints instead)
-
-    // ==== PHASE 2: Compact subgraph EK ====
-    // Two BFS identify the active subgraph (reachable from source AND reaching sink).
-    // Build compact CSR, run CPU EK on it. Much faster than full-graph EK.
+    // ==== PHASE 2: CPU EIBFS attempt (skipped — GPU EK fallback handles it) ====
+    if (false)  // EIBFS disabled: tree maintenance too slow on this graph
     {
-        auto t_cleanup_start = std::chrono::high_resolution_clock::now();
-
-        // Step 1: Forward BFS from source on residual (reuse level array)
-        // level[v] >= 0 means reachable from source (already set by last Dinic BFS)
-        // But Dinic may have modified flow since last BFS. Re-do a full forward BFS.
-        cudaMemset(d_level, 0xFF, num_nodes * sizeof(int));
-        int zero = 0;
-        cudaMemcpy(d_level + source, &zero, sizeof(int), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_frontier, &src_val, sizeof(int), cudaMemcpyHostToDevice);
-        int fsize = 1, cur_lev = 0;
-        while (fsize > 0) {
-            cudaMemset(d_next_count, 0, sizeof(int));
-            k_dinic_bfs_expand<<<(fsize+B-1)/B, B>>>(
-                d_nindex, d_nlist, d_cap, d_flow,
-                d_rnindex, d_rnlist, d_retoe,
-                d_frontier, fsize, cur_lev,
-                d_level, d_next_frontier, d_next_count);
-            cudaMemcpy(&fsize, d_next_count, sizeof(int), cudaMemcpyDeviceToHost);
-            std::swap(d_frontier, d_next_frontier);
-            cur_lev++;
-        }
-
-        // Step 2: Backward BFS from sink on full residual (no level check)
-        cudaMemset(d_reach, 0, num_nodes * sizeof(int));
-        int one = 1;
-        cudaMemcpy(d_reach + sink, &one, sizeof(int), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_frontier, &sink_val, sizeof(int), cudaMemcpyHostToDevice);
-        fsize = 1;
-        while (fsize > 0) {
-            cudaMemset(d_next_count, 0, sizeof(int));
-            k_bfs_backward_residual<<<(fsize+B-1)/B, B>>>(
-                d_nindex, d_nlist, d_rnindex, d_rnlist, d_retoe,
-                d_cap, d_flow,
-                d_frontier, fsize,
-                d_reach, d_next_frontier, d_next_count);
-            cudaMemcpy(&fsize, d_next_count, sizeof(int), cudaMemcpyDeviceToHost);
-            std::swap(d_frontier, d_next_frontier);
-        }
-
-        // Download level and reach arrays
-        std::vector<int> h_level(num_nodes), h_reach(num_nodes);
-        cudaMemcpy(h_level.data(), d_level, num_nodes * sizeof(int), cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_reach.data(), d_reach, num_nodes * sizeof(int), cudaMemcpyDeviceToHost);
-
-        // Also need flow on host for compact EK
-        // (already downloaded into result.edge_flows above)
-
-        // Step 3: Build compact subgraph
-        // Active nodes: level[v] >= 0 AND reach[v] == 1
-        std::vector<int> node_map(num_nodes, -1);  // original → compact
-        int K = 0;
-        for (int v = 0; v < num_nodes; v++) {
-            if (h_level[v] >= 0 && h_reach[v]) {
-                node_map[v] = K++;
-            }
-        }
-        // Always include source and sink
-        if (node_map[source] == -1) node_map[source] = K++;
-        if (node_map[sink] == -1) node_map[sink] = K++;
-
-        int compact_src = node_map[source];
-        int compact_sink = node_map[sink];
-
-        // Build compact CSR + reverse CSR
-        // First pass: count edges per compact node
-        std::vector<int> c_nindex(K + 1, 0);
+        auto t_ibfs_start = std::chrono::high_resolution_clock::now();
         int* h_flow = result.edge_flows.data();
-        for (int u = 0; u < num_nodes; u++) {
-            if (node_map[u] == -1) continue;
-            int cu = node_map[u];
-            for (int e = h_nindex[u]; e < h_nindex[u + 1]; e++) {
-                int v = h_nlist[e];
-                if (node_map[v] == -1) continue;
-                if (h_cap[e] - h_flow[e] <= 0) continue;
-                c_nindex[cu + 1]++;
-            }
-            // Backward residual edges: for each edge w->u with flow>0
-            for (int re = h_rnindex[u]; re < h_rnindex[u + 1]; re++) {
-                int w = h_rnlist[re];
-                if (node_map[w] == -1) continue;
-                int ef = h_retoe[re];
-                if (h_flow[ef] <= 0) continue;
-                c_nindex[cu + 1]++;
-            }
-        }
-        for (int i = 1; i <= K; i++) c_nindex[i] += c_nindex[i - 1];
-        int c_num_edges = c_nindex[K];
 
-        std::vector<int> c_nlist(c_num_edges), c_cap(c_num_edges);
-        std::vector<int> c_orig_edge(c_num_edges);  // map compact edge → original edge
-        std::vector<int> c_dir(c_num_edges);         // +1 forward, -1 backward
-        std::vector<int> c_offset(K, 0);
+        // EIBFS state arrays
+        std::vector<int> dist(num_nodes, num_nodes);  // distance from source
+        std::vector<int> par(num_nodes, -1);           // parent node
+        std::vector<int> par_e(num_nodes, -1);         // parent edge (CSR index)
+        std::vector<int> par_d(num_nodes, 0);          // parent direction (+1/-1)
+        std::vector<int> firstSon(num_nodes, -1);      // children linked list head
+        std::vector<int> nextSib(num_nodes, -1);       // next sibling in children list
 
-        for (int u = 0; u < num_nodes; u++) {
-            if (node_map[u] == -1) continue;
-            int cu = node_map[u];
-            // Forward edges
-            for (int e = h_nindex[u]; e < h_nindex[u + 1]; e++) {
-                int v = h_nlist[e];
-                if (node_map[v] == -1) continue;
-                int res = h_cap[e] - h_flow[e];
-                if (res <= 0) continue;
-                int pos = c_nindex[cu] + c_offset[cu]++;
-                c_nlist[pos] = node_map[v];
-                c_cap[pos] = res;
-                c_orig_edge[pos] = e;
-                c_dir[pos] = 1;
-            }
-            // Backward residual edges
-            for (int re = h_rnindex[u]; re < h_rnindex[u + 1]; re++) {
-                int w = h_rnlist[re];
-                if (node_map[w] == -1) continue;
-                int ef = h_retoe[re];
-                if (h_flow[ef] <= 0) continue;
-                int pos = c_nindex[cu] + c_offset[cu]++;
-                c_nlist[pos] = node_map[w];
-                c_cap[pos] = h_flow[ef];
-                c_orig_edge[pos] = ef;
-                c_dir[pos] = -1;
-            }
-        }
-
-        printf("[TIMING]       Compact subgraph: %d nodes, %d edges (from %d/%d)\n",
-               K, c_num_edges, num_nodes, num_edges);
-
-        // Step 4: CPU Edmonds-Karp on compact graph
-        std::vector<int> c_flow(c_num_edges, 0);
-        std::vector<int> c_par(K), c_par_e(K), c_par_d(K);
-        std::vector<int> c_bfs_q;
-        c_bfs_q.reserve(K);
-        int ek_augs = 0, ek_flow = 0;
-
-        while (true) {
-            std::fill(c_par.begin(), c_par.end(), -1);
-            c_par[compact_src] = compact_src;
-            c_bfs_q.clear();
-            c_bfs_q.push_back(compact_src);
-
-            bool found = false;
-            for (int qi = 0; qi < (int)c_bfs_q.size() && !found; qi++) {
-                int u = c_bfs_q[qi];
-                for (int e = c_nindex[u]; e < c_nindex[u + 1]; e++) {
-                    int v = c_nlist[e];
-                    if (c_par[v] != -1) continue;
-                    if (c_cap[e] - c_flow[e] <= 0) continue;
-                    c_par[v] = u; c_par_e[v] = e; c_par_d[v] = 1;
-                    c_bfs_q.push_back(v);
-                    if (v == compact_sink) { found = true; break; }
+        // Build initial BFS tree with children tracking
+        auto full_bfs = [&]() -> bool {
+            std::fill(dist.begin(), dist.end(), num_nodes);
+            std::fill(par.begin(), par.end(), -1);
+            std::fill(firstSon.begin(), firstSon.end(), -1);
+            std::fill(nextSib.begin(), nextSib.end(), -1);
+            dist[source] = 0; par[source] = source;
+            std::vector<int> q;
+            q.reserve(num_nodes);
+            q.push_back(source);
+            for (int qi = 0; qi < (int)q.size(); qi++) {
+                int u = q[qi];
+                for (int e = h_nindex[u]; e < h_nindex[u+1]; e++) {
+                    int v = h_nlist[e];
+                    if (dist[v] != num_nodes) continue;
+                    if (h_cap[e] - h_flow[e] <= 0) continue;
+                    dist[v] = dist[u] + 1;
+                    par[v] = u; par_e[v] = e; par_d[v] = 1;
+                    nextSib[v] = firstSon[u]; firstSon[u] = v;
+                    q.push_back(v);
+                }
+                for (int re = h_rnindex[u]; re < h_rnindex[u+1]; re++) {
+                    int v = h_rnlist[re];
+                    int ef = h_retoe[re];
+                    if (dist[v] != num_nodes) continue;
+                    if (h_flow[ef] <= 0) continue;
+                    dist[v] = dist[u] + 1;
+                    par[v] = u; par_e[v] = ef; par_d[v] = -1;
+                    nextSib[v] = firstSon[u]; firstSon[u] = v;
+                    q.push_back(v);
                 }
             }
-            if (!found) break;
+            return dist[sink] < num_nodes;
+        };
 
-            int bn = INT_MAX;
-            for (int v = compact_sink; v != compact_src; v = c_par[v]) {
-                int r = c_cap[c_par_e[v]] - c_flow[c_par_e[v]];
-                if (r < bn) bn = r;
+        // Remove node from parent's children list
+        auto remove_child = [&](int child) {
+            int p = par[child];
+            if (p == -1 || p == child) return;
+            if (firstSon[p] == child) {
+                firstSon[p] = nextSib[child];
+            } else {
+                int c = firstSon[p];
+                while (c != -1 && nextSib[c] != child) c = nextSib[c];
+                if (c != -1) nextSib[c] = nextSib[child];
             }
-            for (int v = compact_sink; v != compact_src; v = c_par[v]) {
-                c_flow[c_par_e[v]] += bn;
-            }
-            ek_augs++;
-            ek_flow += bn;
-        }
+            nextSib[child] = -1;
+        };
 
-        // Step 5: Map compact flow back to original edges
-        for (int e = 0; e < c_num_edges; e++) {
-            if (c_flow[e] <= 0) continue;
-            int orig_e = c_orig_edge[e];
-            int dir = c_dir[e];
-            if (dir == 1)
-                result.edge_flows[orig_e] += c_flow[e];
-            else
-                result.edge_flows[orig_e] -= c_flow[e];
-        }
-        total_flow += ek_flow;
+        // Add node as child of new parent
+        auto add_child = [&](int child, int parent_node) {
+            nextSib[child] = firstSon[parent_node];
+            firstSon[parent_node] = child;
+        };
 
-        auto t_cleanup_end = std::chrono::high_resolution_clock::now();
-        double cleanup_s = std::chrono::duration<double>(t_cleanup_end - t_cleanup_start).count();
-        printf("[TIMING]       Compact EK cleanup: %d augmentations, flow=%d, total flow=%d (%.3f s)\n",
-               ek_augs, ek_flow, total_flow, cleanup_s);
+        int ibfs_augs = 0, ibfs_flow = 0, bfs_rebuilds = 0;
+
+        const double IBFS_TIMEOUT = 2.0;  // seconds
+        bool ibfs_timed_out = false;
+
+        while (full_bfs()) {
+            bfs_rebuilds++;
+            bool need_rebuild = false;
+
+            while (!need_rebuild && dist[sink] < num_nodes) {
+                // Check timeout
+                auto t_now = std::chrono::high_resolution_clock::now();
+                if (std::chrono::duration<double>(t_now - t_ibfs_start).count() > IBFS_TIMEOUT) {
+                    ibfs_timed_out = true;
+                    need_rebuild = true;
+                    break;
+                }
+                // Trace path, find bottleneck
+                int bn = INT_MAX;
+                for (int v = sink; v != source; v = par[v]) {
+                    int e = par_e[v];
+                    int r = (par_d[v] == 1) ? (h_cap[e] - h_flow[e]) : h_flow[e];
+                    if (r < bn) bn = r;
+                }
+                if (bn <= 0) { need_rebuild = true; break; }
+
+                // Push flow, collect saturated edges
+                std::vector<int> orphans;
+                for (int v = sink; v != source; v = par[v]) {
+                    int e = par_e[v];
+                    if (par_d[v] == 1) h_flow[e] += bn; else h_flow[e] -= bn;
+                    // Check if parent edge saturated
+                    int r = (par_d[v] == 1) ? (h_cap[e] - h_flow[e]) : h_flow[e];
+                    if (r <= 0) orphans.push_back(v);
+                }
+                total_flow += bn;
+                ibfs_augs++;
+                ibfs_flow += bn;
+
+                // EIBFS orphan processing with cascading
+                std::queue<int> orphan_q;
+                for (int o : orphans) {
+                    remove_child(o);
+                    par[o] = -1;
+                    orphan_q.push(o);
+                }
+
+                while (!orphan_q.empty()) {
+                    int o = orphan_q.front(); orphan_q.pop();
+                    if (o == source || o == sink) continue;
+                    int old_dist = dist[o];
+
+                    // Try to re-adopt at same distance (dist-1 parent)
+                    bool adopted = false;
+
+                    // Forward edges TO o: u→o with residual, dist[u]==old_dist-1
+                    for (int re = h_rnindex[o]; re < h_rnindex[o+1] && !adopted; re++) {
+                        int u = h_rnlist[re];
+                        int ef = h_retoe[re];
+                        if (dist[u] != old_dist - 1) continue;
+                        if (par[u] == -1 && u != source) continue;  // u must be in tree
+                        if (h_cap[ef] - h_flow[ef] <= 0) continue;
+                        par[o] = u; par_e[o] = ef; par_d[o] = 1;
+                        add_child(o, u);
+                        adopted = true;
+                    }
+                    // Backward residual: o→w with flow>0, dist[w]==old_dist-1
+                    for (int e = h_nindex[o]; e < h_nindex[o+1] && !adopted; e++) {
+                        int w = h_nlist[e];
+                        if (dist[w] != old_dist - 1) continue;
+                        if (par[w] == -1 && w != source) continue;
+                        if (h_flow[e] <= 0) continue;
+                        par[o] = w; par_e[o] = e; par_d[o] = -1;
+                        add_child(o, w);
+                        adopted = true;
+                    }
+
+                    if (adopted) continue;
+
+                    // Try higher distances (relabel upward)
+                    for (int try_dist = old_dist; try_dist < old_dist + 50 && !adopted; try_dist++) {
+                        for (int re = h_rnindex[o]; re < h_rnindex[o+1] && !adopted; re++) {
+                            int u = h_rnlist[re];
+                            int ef = h_retoe[re];
+                            if (dist[u] != try_dist) continue;
+                            if (par[u] == -1 && u != source) continue;
+                            if (h_cap[ef] - h_flow[ef] <= 0) continue;
+                            dist[o] = try_dist + 1;
+                            par[o] = u; par_e[o] = ef; par_d[o] = 1;
+                            add_child(o, u);
+                            adopted = true;
+                        }
+                        for (int e = h_nindex[o]; e < h_nindex[o+1] && !adopted; e++) {
+                            int w = h_nlist[e];
+                            if (dist[w] != try_dist) continue;
+                            if (par[w] == -1 && w != source) continue;
+                            if (h_flow[e] <= 0) continue;
+                            dist[o] = try_dist + 1;
+                            par[o] = w; par_e[o] = e; par_d[o] = -1;
+                            add_child(o, w);
+                            adopted = true;
+                        }
+                    }
+
+                    if (!adopted) {
+                        // Cascade: orphan all children of o
+                        int c = firstSon[o];
+                        while (c != -1) {
+                            int next_c = nextSib[c];
+                            par[c] = -1;
+                            nextSib[c] = -1;
+                            orphan_q.push(c);
+                            c = next_c;
+                        }
+                        firstSon[o] = -1;
+                        dist[o] = num_nodes;
+                        par[o] = -1;
+                    }
+                }
+
+                // Check if sink still reachable
+                if (par[sink] == -1 || dist[sink] >= num_nodes) {
+                    need_rebuild = true;
+                }
+            } // end inner while
+
+            if (ibfs_timed_out) break;
+        } // end outer while(full_bfs())
+
+        auto t_ibfs_end = std::chrono::high_resolution_clock::now();
+        double ibfs_s = std::chrono::duration<double>(t_ibfs_end - t_ibfs_start).count();
+        printf("[TIMING]       CPU EIBFS cleanup: %d augs, %d BFS rebuilds, flow=%d, total=%d (%.3f s)%s\n",
+               ibfs_augs, bfs_rebuilds, ibfs_flow, total_flow, ibfs_s,
+               ibfs_timed_out ? " [TIMEOUT - GPU EK fallback]" : "");
     }
+
+    // ==== PHASE 3: GPU EK (remaining flow after Dinic) ====
+    // Flow is already on GPU from Dinic phase. No re-upload needed.
+    {
+        int ek_augs = 0;
+        while (true) {
+            cudaMemset(d_parent, 0xFF, num_nodes*sizeof(int));
+            cudaMemcpy(d_parent+source, &src_val, sizeof(int), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_frontier, &src_val, sizeof(int), cudaMemcpyHostToDevice);
+            int fsize = 1;
+            bool found = false;
+            while (fsize > 0) {
+                cudaMemset(d_next_count, 0, sizeof(int));
+                k_ek_bfs_expand<<<(fsize+B-1)/B, B>>>(
+                    d_nindex, d_nlist, d_cap, d_flow,
+                    d_rnindex, d_rnlist, d_retoe,
+                    d_frontier, fsize,
+                    d_parent, d_parent_edge, d_parent_dir,
+                    d_next_frontier, d_next_count);
+                int sp;
+                cudaMemcpy(&sp, d_parent+sink, sizeof(int), cudaMemcpyDeviceToHost);
+                if (sp != -1) { found = true; break; }
+                cudaMemcpy(&fsize, d_next_count, sizeof(int), cudaMemcpyDeviceToHost);
+                std::swap(d_frontier, d_next_frontier);
+            }
+            if (!found) break;
+            k_ek_trace_push<<<1,1>>>(d_parent, d_parent_edge, d_parent_dir,
+                                      d_cap, d_flow, source, sink, d_bottleneck);
+            int bn;
+            cudaMemcpy(&bn, d_bottleneck, sizeof(int), cudaMemcpyDeviceToHost);
+            total_flow += bn;
+            ek_augs++;
+        }
+        if (ek_augs > 0)
+            printf("[TIMING]       GPU EK fallback: %d augmentations, total flow=%d\n", ek_augs, total_flow);
+    }
+
+    // Download final flow
+    cudaMemcpy(result.edge_flows.data(), d_flow, num_edges*sizeof(int), cudaMemcpyDeviceToHost);
 
     cudaFree(d_nindex); cudaFree(d_nlist); cudaFree(d_cap); cudaFree(d_flow);
     cudaFree(d_rnindex); cudaFree(d_rnlist); cudaFree(d_retoe);
