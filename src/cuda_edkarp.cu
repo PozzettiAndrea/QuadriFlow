@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <climits>
 #include <vector>
+#include <queue>
 #include <algorithm>
 #include <cuda_runtime.h>
 
@@ -447,47 +448,69 @@ CudaMaxFlowResult cuda_dinic_solve(
     printf("[TIMING]       GPU Dinic phase: %d phases, %d paths, flow=%d\n",
            dinic_phases, total_paths, total_flow);
 
-    // ==== PHASE 2: Edmonds-Karp for remaining flow ====
-    // Handles paths that Dinic's backward BFS pruning missed.
-    // Uses the same GPU arrays (flow state continues from Dinic).
-    int ek_augmentations = 0;
+    // Download flow after Dinic phase
+    cudaMemcpy(result.edge_flows.data(), d_flow, num_edges*sizeof(int), cudaMemcpyDeviceToHost);
 
-    while (true) {
-        cudaMemset(d_parent, 0xFF, num_nodes*sizeof(int));
-        cudaMemcpy(d_parent+source, &src_val, sizeof(int), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_frontier, &src_val, sizeof(int), cudaMemcpyHostToDevice);
-        int fsize = 1;
-        bool found = false;
-
-        while (fsize > 0) {
-            cudaMemset(d_next_count, 0, sizeof(int));
-            k_ek_bfs_expand<<<(fsize+B-1)/B, B>>>(
-                d_nindex, d_nlist, d_cap, d_flow,
-                d_rnindex, d_rnlist, d_retoe,
-                d_frontier, fsize,
-                d_parent, d_parent_edge, d_parent_dir,
-                d_next_frontier, d_next_count);
-            int sp;
-            cudaMemcpy(&sp, d_parent+sink, sizeof(int), cudaMemcpyDeviceToHost);
-            if (sp != -1) { found = true; break; }
-            cudaMemcpy(&fsize, d_next_count, sizeof(int), cudaMemcpyDeviceToHost);
-            std::swap(d_frontier, d_next_frontier);
+    // Save intermediate flow state for debugging/testing different cleanup strategies
+    {
+        FILE* fp = fopen("/tmp/qf-dinic-flow.bin", "wb");
+        if (fp) {
+            fwrite(&num_nodes, sizeof(int), 1, fp);
+            fwrite(&num_edges, sizeof(int), 1, fp);
+            fwrite(&source, sizeof(int), 1, fp);
+            fwrite(&sink, sizeof(int), 1, fp);
+            fwrite(&total_flow, sizeof(int), 1, fp);
+            fwrite(result.edge_flows.data(), sizeof(int), num_edges, fp);
+            fwrite(h_nindex, sizeof(int), num_nodes+1, fp);
+            fwrite(h_nlist, sizeof(int), num_edges, fp);
+            fwrite(h_cap, sizeof(int), num_edges, fp);
+            fwrite(h_rnindex, sizeof(int), num_nodes+1, fp);
+            fwrite(h_rnlist, sizeof(int), num_edges, fp);
+            fwrite(h_retoe, sizeof(int), num_edges, fp);
+            fclose(fp);
+            printf("[TIMING]       Saved Dinic flow state to /tmp/qf-dinic-flow.bin\n");
         }
-        if (!found) break;
-
-        k_ek_trace_push<<<1,1>>>(d_parent, d_parent_edge, d_parent_dir,
-                                  d_cap, d_flow, source, sink, d_bottleneck);
-        int bn;
-        cudaMemcpy(&bn, d_bottleneck, sizeof(int), cudaMemcpyDeviceToHost);
-        total_flow += bn;
-        ek_augmentations++;
     }
 
-    if (ek_augmentations > 0) {
-        printf("[TIMING]       GPU EK cleanup: %d augmentations, total flow=%d\n",
-               ek_augmentations, total_flow);
+    // ==== PHASE 2: GPU EK for remaining flow ====
+    // Reuse GPU arrays. Flow already on device from Dinic phase.
+    // Re-upload since we downloaded for the debug save.
+    cudaMemcpy(d_flow, result.edge_flows.data(), num_edges*sizeof(int), cudaMemcpyHostToDevice);
+    {
+        int ek_augs = 0;
+        while (true) {
+            cudaMemset(d_parent, 0xFF, num_nodes*sizeof(int));
+            cudaMemcpy(d_parent+source, &src_val, sizeof(int), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_frontier, &src_val, sizeof(int), cudaMemcpyHostToDevice);
+            int fsize = 1;
+            bool found = false;
+            while (fsize > 0) {
+                cudaMemset(d_next_count, 0, sizeof(int));
+                k_ek_bfs_expand<<<(fsize+B-1)/B, B>>>(
+                    d_nindex, d_nlist, d_cap, d_flow,
+                    d_rnindex, d_rnlist, d_retoe,
+                    d_frontier, fsize,
+                    d_parent, d_parent_edge, d_parent_dir,
+                    d_next_frontier, d_next_count);
+                int sp;
+                cudaMemcpy(&sp, d_parent+sink, sizeof(int), cudaMemcpyDeviceToHost);
+                if (sp != -1) { found = true; break; }
+                cudaMemcpy(&fsize, d_next_count, sizeof(int), cudaMemcpyDeviceToHost);
+                std::swap(d_frontier, d_next_frontier);
+            }
+            if (!found) break;
+            k_ek_trace_push<<<1,1>>>(d_parent, d_parent_edge, d_parent_dir,
+                                      d_cap, d_flow, source, sink, d_bottleneck);
+            int bn;
+            cudaMemcpy(&bn, d_bottleneck, sizeof(int), cudaMemcpyDeviceToHost);
+            total_flow += bn;
+            ek_augs++;
+        }
+        if (ek_augs > 0)
+            printf("[TIMING]       GPU EK cleanup: %d augmentations, total flow=%d\n", ek_augs, total_flow);
     }
 
+    // Download final flow
     cudaMemcpy(result.edge_flows.data(), d_flow, num_edges*sizeof(int), cudaMemcpyDeviceToHost);
 
     cudaFree(d_nindex); cudaFree(d_nlist); cudaFree(d_cap); cudaFree(d_flow);
