@@ -42,13 +42,19 @@ PATH=/usr/local/cuda-13/bin:/usr/bin:/bin:$PATH cmake .. -DCMAKE_BUILD_TYPE=Rele
 - `src/checkpoint.cpp/hpp` — Binary checkpoint save/load
 
 ## Current Performance (Stanford Dragon, 871K faces → 100K target)
-- Initialize (GPU subdiv): ~4s
-- Field solving (GPU PCG): ~4s
-- BuildIntegerConstraints: ~4-6s (CPU)
+- Initialize (GPU subdiv): ~4-6s (subdivision 0.27s GPU, hierarchy 2s CPU, copy 0.8s)
+- Field solving (GPU PCG): ~4s (orient 0.7s, scale 0.1s, position 3.5s)
+- BuildIntegerConstraints: ~4.7s (100% CPU — union-find + BFS, unordered_map optimized)
 - ComputeMaxFlow (edkarp): ~25s (GPU EK, 43K bad edges)
-- subdivide_edgeDiff: ~3-5s (CPU)
-- FixFlipHierarchy: ~8s (CPU)
-- Extract + dynamic: ~8s (mixed)
+- subdivide_edgeDiff: ~3.4s (100% CPU — priority-queue splitting with orientation recomputation)
+- FixFlipHierarchy: ~8s+ (100% CPU — recursive hierarchy, fundamentally sequential)
+- Extract + dynamic: ~8s (mixed — pre-dynamic CSR 2.3s with unordered_map)
+
+## Nsight Systems Profile Results (saved in /home/shadeform/qf_nsight/)
+- **Initialize**: 258ms GPU kernels, 5.6s CPU (96% CPU-bound: graph coloring + downsample loops)
+- **BuildIntegerConstraints**: 0ms GPU, 4.8s CPU (100% CPU: union-find, BFS, orientation compat)
+- **subdivide_edgeDiff**: 0ms GPU, 3.1s CPU (100% CPU: priority queue + compat_orientation calls)
+- **ComputeMaxFlow**: ~24s GPU, ~1s CPU (96% GPU: BFS kernels, memory-latency bound)
 
 ## Flow Solver Strategies
 | Strategy | Flag | Time | Bad edges | Notes |
