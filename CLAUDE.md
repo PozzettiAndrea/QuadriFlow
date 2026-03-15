@@ -74,6 +74,22 @@ PATH=/usr/local/cuda-13/bin:/usr/bin:/bin:$PATH cmake .. -DCMAKE_BUILD_TYPE=Rele
 ## Council of Boffins
 Debate format for hard problems. 4 experts: Lena (geometer), Ravi (graph theory), Doug (NVIDIA systems), Keiko (CUDA kernels). Description at `/home/shadeform/boffins.md`. 21 sessions documented in conversation history.
 
+## Current Best Timings (per-stage, from checkpoints)
+| Stage | Time | Device |
+|---|---|---|
+| Initialize (GPU subdiv) | ~4.4s | CPU+GPU |
+| Field solving | ~4.3s | GPU |
+| BuildIntegerConstraints | ~4.5s | CPU |
+| ComputeMaxFlow (edkarp) | ~25s | GPU |
+| subdivide_edgeDiff (1st) | ~3.4s | CPU |
+| FixFlipHierarchy (depth=3) | ~4.1s | CPU |
+| subdivide_edgeDiff (2nd) | ~2.6s | CPU |
+| optimize_positions_sharp+fixed | ~7.3s | CPU+GPU |
+| AdvancedExtractQuad | ~4.3s | CPU |
+| pre-dynamic + dynamic | ~11s | CPU+GPU |
+| **TOTAL** | **~71s** | |
+| **vs Boykov baseline** | **~160s** | **2.3x faster** |
+
 ## Key Findings
 - GPU subdivision: Luby-like independent set with length-based priority prevents race conditions
 - Mesh residual graphs stay 99.98% connected — no compaction/subgraph tricks work
@@ -81,3 +97,25 @@ Debate format for hard problems. 4 experts: Lena (geometer), Ravi (graph theory)
 - Augmenting-path algorithms (EK, Dinic) produce good quality but are inherently sequential per augmentation
 - IBFS/BK tree reuse is theoretically ideal but hard to implement correctly (orphan cascading)
 - JF-Cut is grid-only, doesn't apply to CSR mesh graphs
+- Direction-optimizing BFS: doesn't help on mesh graphs (uniform degree, high diameter)
+- GPU DSE hangs on multi-level builds — forced to CPU DSE (works fine)
+- unordered_map + reserve() saved ~4s across BuildIntegerConstraints + pre-dynamic
+- Penner optimization: NaN divergence / slow convergence on real meshes (not a quick replacement)
+
+## Approaches Tried (with results)
+| Approach | Result | Status |
+|---|---|---|
+| GPU subdivision (Luby IS) | 10.8x speedup | **Working** |
+| GPU Edmonds-Karp flow | 4.4x vs Boykov | **Working (default)** |
+| GPU Dinic + EK hybrid | 6.3x vs Boykov | Cleanup phase buggy |
+| GPU push-relabel + refinement | Fast but poor quality | Available as strategy |
+| unordered_map optimization | -4s across stages | **Working** |
+| FixFlip depth cap | -2.2s | **Working (depth=3)** |
+| o2e.reserve() | -2.5s pre-dynamic | **Working** |
+| Raw math compat_orientation | -0.2s | **Working** (marginal) |
+| Direction-optimizing BFS | Slower on mesh graphs | Failed |
+| Compact subgraph EK | 99.98% still active | Failed |
+| IBFS/BK tree reuse | Cycle bugs (3 attempts) | Failed |
+| JF-Cut push-relabel | Grid-only algorithm | Failed |
+| Selective BFS reset | D2D copy overhead | Failed |
+| Penner optimization | NaN/slow on real meshes | Not viable yet |
