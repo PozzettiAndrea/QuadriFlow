@@ -3,6 +3,13 @@
 #include "config.hpp"
 #include "field-math.hpp"
 #include "hierarchy.hpp"
+#include <unordered_map>
+
+struct PairHash {
+    size_t operator()(const std::pair<int,int>& p) const {
+        return std::hash<long long>()(((long long)p.first << 32) | (unsigned int)p.second);
+    }
+};
 
 namespace qflow {
 
@@ -27,7 +34,7 @@ class Optimizer {
         std::vector<Vector3d>& O_compact, std::vector<Vector4i>& F_compact,
         std::vector<int>& V2E_compact, std::vector<int>& E2E_compact, double mScale,
         std::vector<Vector3d>& diffs, std::vector<int>& diff_count,
-        std::map<std::pair<int, int>, int>& o2e, std::vector<int>& sharp_o,
+        std::unordered_map<std::pair<int, int>, int, PairHash>& o2e, std::vector<int>& sharp_o,
         std::map<int, std::pair<Vector3d, Vector3d>>& compact_sharp_constraints, int with_scale);
 #ifdef WITH_CUDA
     static void optimize_orientations_cuda(Hierarchy& mRes);

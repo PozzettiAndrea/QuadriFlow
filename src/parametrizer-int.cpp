@@ -171,15 +171,16 @@ void Parametrizer::BuildIntegerConstraints() {
     // label the connected component connected by non-fixed edges
     // we need this because we need sink flow (demand) == source flow (supply) for each component
     // rather than global
+    std::vector<int> bfs_q;
+    bfs_q.reserve(sharp_colors.size());
     for (int i = 0; i < sharp_colors.size(); ++i) {
         if (sharp_colors[i] != -1) continue;
         sharp_colors[i] = num_sharp_component;
-        std::queue<int> q;
-        q.push(i);
+        bfs_q.clear();
+        bfs_q.push_back(i);
         int counter = 0;
-        while (!q.empty()) {
-            int v = q.front();
-            q.pop();
+        for (int qi = 0; qi < (int)bfs_q.size(); qi++) {
+            int v = bfs_q[qi];
             for (int i = 0; i < 3; ++i) {
                 int e = face_edgeIds[v][i];
                 int deid1 = E2D[e].first;
@@ -196,7 +197,7 @@ void Parametrizer::BuildIntegerConstraints() {
                     int f = (k == 0) ? E2D[e].first / 3 : E2D[e].second / 3;
                     if (sharp_colors[f] == -1) {
                         sharp_colors[f] = num_sharp_component;
-                        q.push(f);
+                        bfs_q.push_back(f);
                     }
                 }
             }

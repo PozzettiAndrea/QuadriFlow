@@ -6,6 +6,7 @@
 #include "subdivide.hpp"
 #include <stdlib.h>
 #include <string.h>
+#include <unordered_map>
 
 #ifdef WITH_CUDA
 #include <cuda_runtime.h>
@@ -495,7 +496,7 @@ int main(int argc, char** argv) {
         // ---- pre-dynamic setup + optimize_positions_dynamic ----
         if (should_run(STAGE_POST_DYNAMIC)) {
             // Build edge-to-quad mapping and diffs
-            std::map<std::pair<int, int>, int> o2e;
+            std::unordered_map<std::pair<int, int>, int, PairHash> o2e;
             for (int i = 0; i < (int)field.F_compact.size(); ++i) {
                 for (int j = 0; j < 4; ++j) {
                     int v1 = field.F_compact[i][j];

@@ -173,7 +173,7 @@ void Optimizer::optimize_scale(Hierarchy& mRes, VectorXd& rho, int adaptive) {
             }
         }
 
-        std::vector<std::map<int, double>> entries(V.cols() * 2);
+        std::vector<std::unordered_map<int, double>> entries(V.cols() * 2);
         double lambda = 1;
         for (int i = 0; i < entries.size(); ++i) {
             entries[i][i] = lambda;
@@ -406,7 +406,7 @@ void Optimizer::optimize_positions_dynamic(
     std::vector<Vector3d>& O_compact, std::vector<Vector4i>& F_compact,
     std::vector<int>& V2E_compact, std::vector<int>& E2E_compact, double mScale,
     std::vector<Vector3d>& diffs, std::vector<int>& diff_count,
-    std::map<std::pair<int, int>, int>& o2e, std::vector<int>& sharp_o,
+    std::unordered_map<std::pair<int, int>, int, PairHash>& o2e, std::vector<int>& sharp_o,
     std::map<int, std::pair<Vector3d, Vector3d>>& compact_sharp_constraints, int with_scale) {
     std::set<int> uncertain;
     for (auto& info : o2e) {
@@ -621,8 +621,8 @@ void Optimizer::optimize_positions_dynamic(
 
     // Build CSR pattern using first-iteration approach: collect (row, col) pairs
     // Each non-fixed edge contributes a 4x4 block (filtered by fixed_dim)
-    // Use std::map for sorted column indices per row
-    std::vector<std::map<int, int>> row_cols(dim);  // row -> {col -> value_index}
+    // Use unordered_map for fast insertion, sort columns later for CSR
+    std::vector<std::unordered_map<int, int>> row_cols(dim);  // row -> {col -> value_index}
     int val_count = 0;
     // Edge contributions
     for (int ei = 0; ei < (int)edge_list.size(); ++ei) {
@@ -650,12 +650,17 @@ void Optimizer::optimize_positions_dynamic(
     }
     int csr_nnz = csr_rowPtr[dim];
     std::vector<int> csr_colInd(csr_nnz);
-    // Fill column indices and assign value positions
+    // Fill column indices (sort for CSR) and assign value positions
     for (int i = 0; i < dim; ++i) {
         int pos = csr_rowPtr[i];
-        for (auto& kv : row_cols[i]) {
-            kv.second = pos;  // store position
-            csr_colInd[pos] = kv.first;
+        // Collect and sort column indices
+        std::vector<int> cols;
+        cols.reserve(row_cols[i].size());
+        for (auto& kv : row_cols[i]) cols.push_back(kv.first);
+        std::sort(cols.begin(), cols.end());
+        for (int c : cols) {
+            row_cols[i][c] = pos;
+            csr_colInd[pos] = c;
             pos++;
         }
     }

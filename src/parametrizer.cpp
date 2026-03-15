@@ -13,6 +13,7 @@
 #include <fstream>
 #include <list>
 #include <map>
+#include <unordered_map>
 #include <queue>
 #include <set>
 
@@ -194,7 +195,7 @@ void Parametrizer::ComputeIndexMap(int with_scale) {
         }
     }
 
-    std::map<std::pair<int, int>, int> o2e;
+    std::unordered_map<std::pair<int, int>, int, PairHash> o2e;
     for (int i = 0; i < F_compact.size(); ++i) {
         for (int j = 0; j < 4; ++j) {
             int v1 = F_compact[i][j];
