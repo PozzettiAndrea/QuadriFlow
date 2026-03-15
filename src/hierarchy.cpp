@@ -508,7 +508,7 @@ void Hierarchy::DownsampleEdgeGraph(std::vector<Vector3i>& FQ, std::vector<Vecto
                                     std::vector<Vector2i>& edge_diff,
                                     std::vector<int>& allow_changes, int level) {
 #ifdef WITH_CUDA
-    {
+    if (dse_strategy != 0) {  // dse_strategy=0 forces CPU path
         int nF = (int)F2E.size();
         int nE = (int)edge_diff.size();
         int max_levels = (level == -1) ? 100 : level;
