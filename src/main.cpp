@@ -529,11 +529,6 @@ int main(int argc, char** argv) {
             unsigned long long _pd2 = GetCurrentTime64();
             std::vector<Vector3d> diffs(field.F_compact.size() * 4, Vector3d(0, 0, 0));
             std::vector<int> diff_count(field.F_compact.size() * 4, 0);
-
-            // Pre-filter qualifying edges (fast scan, ~50ms)
-            struct QualEdge { int i, j, v1, v2, o1, o2; };
-            std::vector<QualEdge> qual_edges;
-            qual_edges.reserve(F.cols());
             for (int i = 0; i < F.cols(); ++i) {
                 for (int j = 0; j < 3; ++j) {
                     int v1 = F(j, i);
@@ -541,22 +536,11 @@ int main(int argc, char** argv) {
                     if (v1 != field.edge_values[field.face_edgeIds[i][j]].x) continue;
                     if (field.edge_diff[field.face_edgeIds[i][j]].array().abs().sum() != 1) continue;
                     if (v2o[v1].size() > 1 || v2o[v2].size() > 1) continue;
-                    int o1 = v2o[v1][0], o2 = v2o[v2][0];
-                    qual_edges.push_back({i, j, v1, v2, o1, o2});
-                }
-            }
-            auto _pd2b = GetCurrentTime64();
-
-            // Process qualifying edges with pre-resolved o2e lookups
-            for (auto& qe : qual_edges) {
-                int i = qe.i, j = qe.j, v1 = qe.v1, v2 = qe.v2;
-                int o1 = qe.o1, o2 = qe.o2;
-                {
-                    {
-                        auto key = std::make_pair(o1, o2);
-                        auto it = o2e.find(key);
-                        if (it != o2e.end()) {
-                            int dedge = it->second;
+                    for (auto o1 : v2o[v1]) {
+                        for (auto o2 : v2o[v2]) {
+                            auto key = std::make_pair(o1, o2);
+                            if (o2e.count(key)) {
+                                int dedge = o2e[key];
                                 Vector3d q_1 = Q.col(v1);
                                 Vector3d q_2 = Q.col(v2);
                                 Vector3d n_1 = N.col(v1);
@@ -578,12 +562,12 @@ int main(int argc, char** argv) {
                                 diff_count[dedge] += 1;
                                 diffs[dedge] += C;
                                 auto key2 = std::make_pair(o2, o1);
-                                auto it2 = o2e.find(key2);
-                                if (it2 != o2e.end()) {
-                                    int dedge2 = it2->second;
+                                if (o2e.count(key2)) {
+                                    int dedge2 = o2e[key2];
                                     diff_count[dedge2] += 1;
                                     diffs[dedge2] -= C;
                                 }
+                            }
                         }
                     }
                 }
@@ -611,9 +595,6 @@ int main(int argc, char** argv) {
             }
 
             unsigned long long _pd3 = GetCurrentTime64();
-            printf("[TIMING] pre-dynamic: qual_edges=%d/%d, filter=%.0f ms, compute=%.0f ms\n",
-                   (int)qual_edges.size(), (int)F.cols() * 3,
-                   (_pd2b - _pd2) * 1.0, (_pd3 - _pd2b) * 1.0);
             for (int i = 0; i < (int)diff_count.size(); ++i) {
                 if (diff_count[i] != 0) {
                     diffs[i] /= diff_count[i];
