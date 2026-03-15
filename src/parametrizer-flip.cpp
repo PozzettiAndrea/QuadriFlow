@@ -250,6 +250,7 @@ void Parametrizer::FixHoles() {
 void Parametrizer::FixFlipHierarchy() {
     Hierarchy fh;
     fh.fixflip_strategy = hierarchy.fixflip_strategy;
+    fh.fixflip_max_depth = hierarchy.fixflip_max_depth;
     unsigned long long _t0 = GetCurrentTime64();
     fh.DownsampleEdgeGraph(face_edgeOrients, face_edgeIds, edge_diff, allow_changes, -1);
     unsigned long long _t1 = GetCurrentTime64();

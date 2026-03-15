@@ -39,6 +39,7 @@ static void print_usage() {
     printf("  -seed <n>               RNG seed\n");
     printf("  -G, --cuda              Enable CUDA for all strategies\n");
     printf("  -ff <strategy>          FixFlip strategy: cpu, gpu-prefilter, gpu-only\n");
+    printf("  -ff-depth <n>           FixFlip max recursion depth (default: 5)\n");
     printf("  -subdiv <strategy>      Subdivide strategy: cpu, cuda\n");
     printf("  -dse <strategy>         DownsampleEdgeGraph strategy: cpu, cuda\n");
     printf("  -flow <strategy>        Max-flow solver: boykov, cuda, lemon, edkarp, dinic\n");
@@ -101,6 +102,8 @@ int main(int argc, char** argv) {
             else if (strcmp(s, "gpu-prefilter") == 0)  field.hierarchy.fixflip_strategy = 1;
             else if (strcmp(s, "gpu-only") == 0)       field.hierarchy.fixflip_strategy = 2;
             else { printf("Unknown -ff strategy: %s\n", s); return 1; }
+        } else if (strcmp(argv[i], "-ff-depth") == 0 && i + 1 < argc) {
+            field.hierarchy.fixflip_max_depth = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-subdiv") == 0 && i + 1 < argc) {
             const char* s = argv[++i];
             if (strcmp(s, "cpu") == 0)        field.hierarchy.subdiv_strategy = 0;

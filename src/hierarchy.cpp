@@ -1537,9 +1537,10 @@ void Hierarchy::FixFlip(int depth) {
     printf("[FF]   scan: %.3f s, checks=%d, flipped=%d, update=%d, strategy=%d\n",
            (_ff2-_ff1)*1e-3, checks, flip_count, update, fixflip_strategy);
 
-    if (update && depth < FIXFLIP_MAX_DEPTH) {
+    if (update && depth < fixflip_max_depth) {
         Hierarchy flip_hierarchy;
         flip_hierarchy.fixflip_strategy = fixflip_strategy;
+        flip_hierarchy.fixflip_max_depth = fixflip_max_depth;
         unsigned long long _ff3 = GetCurrentTime64();
         flip_hierarchy.DownsampleEdgeGraph(mFQ.back(), mF2E.back(), mEdgeDiff.back(),
                                            mAllowChanges.back(), -1);
@@ -1551,7 +1552,7 @@ void Hierarchy::FixFlip(int depth) {
         printf("[FF]   depth=%d recursive: downsample=%.3f fixflip=%.3f update=%.3f s\n",
                depth, (_ff4-_ff3)*1e-3, (_ff5-_ff4)*1e-3, (_ff6-_ff5)*1e-3);
     } else if (update) {
-        printf("[FF]   depth=%d CAPPED at max depth %d, skipping recursion\n", depth, FIXFLIP_MAX_DEPTH);
+        printf("[FF]   depth=%d CAPPED at max depth %d, skipping recursion\n", depth, fixflip_max_depth);
     }
     PropagateEdge();
 }
