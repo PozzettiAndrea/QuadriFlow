@@ -121,7 +121,7 @@ int main(int argc, char** argv) {
         } else if (strcmp(argv[i], "-G") == 0 || strcmp(argv[i], "--cuda") == 0) {
             field.hierarchy.subdiv_strategy = 1;
             field.hierarchy.dse_strategy = 1;
-            field.hierarchy.flow_strategy = 4;
+            field.hierarchy.flow_strategy = 3;  // edkarp (reliable)
             // fixflip stays cpu (GPU doesn't help, see experiments.md §6)
         } else if (strcmp(argv[i], "-save-dir") == 0 && i + 1 < argc) {
             save_dir = argv[++i];

@@ -65,7 +65,7 @@ class Hierarchy {
     //   3 = "edkarp"         — GPU Edmonds-Karp (GPU BFS + GPU augment, good quality)
     //   4 = "dinic"          — GPU Dinic's (GPU fwd+bwd BFS + GPU multi-augment, fastest)
 #ifdef WITH_CUDA
-    int flow_strategy = 4;  // default: GPU Dinic's
+    int flow_strategy = 3;  // default: GPU Edmonds-Karp (reliable, good quality)
 #else
     int flow_strategy = 0;  // default: boykov when no CUDA
 #endif
