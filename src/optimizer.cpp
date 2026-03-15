@@ -589,6 +589,82 @@ void Optimizer::optimize_positions_dynamic(
     BuildConnection();
     int max_iter = 10;
 
+#ifdef WITH_CUDA
+    // ---- GPU acceleration: init context ----
+    // Flatten adj, Vset, dedges to CSR for GPU
+    std::vector<int> adj_ptr_flat, adj_list_flat;
+    {
+        int nV_adj = (int)adj.size();
+        adj_ptr_flat.resize(nV_adj + 1);
+        adj_ptr_flat[0] = 0;
+        for (int i = 0; i < nV_adj; i++) adj_ptr_flat[i + 1] = adj_ptr_flat[i] + (int)adj[i].size();
+        adj_list_flat.resize(adj_ptr_flat[nV_adj]);
+        for (int i = 0; i < nV_adj; i++)
+            for (int j = 0; j < (int)adj[i].size(); j++)
+                adj_list_flat[adj_ptr_flat[i] + j] = adj[i][j];
+    }
+    std::vector<int> vset_ptr_flat, vset_list_flat;
+    {
+        int nQ_vs = (int)Vset.size();
+        vset_ptr_flat.resize(nQ_vs + 1);
+        vset_ptr_flat[0] = 0;
+        for (int i = 0; i < nQ_vs; i++) vset_ptr_flat[i + 1] = vset_ptr_flat[i] + (int)Vset[i].size();
+        vset_list_flat.resize(vset_ptr_flat[nQ_vs]);
+        for (int i = 0; i < nQ_vs; i++)
+            for (int j = 0; j < (int)Vset[i].size(); j++)
+                vset_list_flat[vset_ptr_flat[i] + j] = Vset[i][j];
+    }
+    std::vector<int> dedge_ptr_flat, dedge_list_flat;
+    {
+        int nQ_de = (int)dedges.size();
+        dedge_ptr_flat.resize(nQ_de + 1);
+        dedge_ptr_flat[0] = 0;
+        for (int i = 0; i < nQ_de; i++) dedge_ptr_flat[i + 1] = dedge_ptr_flat[i] + (int)dedges[i].size();
+        dedge_list_flat.resize(dedge_ptr_flat[nQ_de]);
+        for (int i = 0; i < nQ_de; i++) {
+            int j = 0;
+            for (auto val : dedges[i]) dedge_list_flat[dedge_ptr_flat[i] + j++] = val;
+        }
+    }
+
+    int nQ_gpu = (int)O_compact.size();
+    int nDE_gpu = (int)diffs.size();
+    void* dyn_ctx = cuda_dyn_init(
+        V.data(), N.data(), (int)V.cols(),
+        adj_ptr_flat.data(), adj_list_flat.data(), (int)adj_list_flat.size(),
+        vset_ptr_flat.data(), vset_list_flat.data(), (int)vset_list_flat.size(),
+        dedge_ptr_flat.data(), dedge_list_flat.data(), (int)dedge_list_flat.size(),
+        nQ_gpu, nDE_gpu);
+
+    // Flat buffers for GPU interaction
+    std::vector<double> O_flat(nQ_gpu * 3), diffs_flat(nDE_gpu * 3);
+    auto pack_O = [&]() {
+        for (int i = 0; i < nQ_gpu; i++) {
+            O_flat[i * 3] = O_compact[i].x();
+            O_flat[i * 3 + 1] = O_compact[i].y();
+            O_flat[i * 3 + 2] = O_compact[i].z();
+        }
+    };
+    auto unpack_O = [&]() {
+        for (int i = 0; i < nQ_gpu; i++) {
+            O_compact[i] = Vector3d(O_flat[i * 3], O_flat[i * 3 + 1], O_flat[i * 3 + 2]);
+        }
+    };
+    auto pack_diffs = [&]() {
+        for (int i = 0; i < nDE_gpu; i++) {
+            diffs_flat[i * 3] = diffs[i].x();
+            diffs_flat[i * 3 + 1] = diffs[i].y();
+            diffs_flat[i * 3 + 2] = diffs[i].z();
+        }
+    };
+    auto unpack_diffs = [&]() {
+        for (int i = 0; i < nDE_gpu; i++) {
+            diffs[i] = Vector3d(diffs_flat[i * 3], diffs_flat[i * 3 + 1], diffs_flat[i * 3 + 2]);
+        }
+    };
+    bool dyn_fill_csr_inited = false;
+#endif
+
     // Precompute CSR pattern + edge list (constant across iterations)
     int dim = O_compact.size() * 2;
     std::vector<int> fixed_dim(dim, 0);
@@ -701,7 +777,13 @@ void Optimizer::optimize_positions_dynamic(
 #endif
     for (int iter = 0; iter < max_iter; ++iter) {
         int _t0 = GetCurrentTime64();
+#ifdef WITH_CUDA
+        pack_O(); pack_diffs();
+        cuda_dyn_find_nearest(dyn_ctx, O_flat.data(), Vind.data(), diffs_flat.data(), iter);
+        unpack_O(); unpack_diffs();
+#else
         FindNearest();
+#endif
         int _t1 = GetCurrentTime64();
         ComputeDistance();
         int _t2 = GetCurrentTime64();
@@ -734,10 +816,53 @@ void Optimizer::optimize_positions_dynamic(
         }
         int _t3 = GetCurrentTime64();
 
-        // Fill CSR values + RHS directly (no triplets, no Eigen)
+        // Fill CSR values + RHS
         std::vector<double> csr_val(csr_nnz, 0.0);
         VectorXd rhs = VectorXd::Zero(dim);
 
+#ifdef WITH_CUDA
+        // GPU fillCSR
+        if (!dyn_fill_csr_inited) {
+            // Flatten edge_csr_pos and edge_list for GPU
+            std::vector<int> h_ei(edge_list.size()), h_ej(edge_list.size()), h_ede(edge_list.size());
+            std::vector<int> h_ecsr(edge_list.size() * 16);
+            for (int ei2 = 0; ei2 < (int)edge_list.size(); ei2++) {
+                h_ei[ei2] = edge_list[ei2].i;
+                h_ej[ei2] = edge_list[ei2].j;
+                h_ede[ei2] = edge_list[ei2].de;
+                for (int k = 0; k < 16; k++)
+                    h_ecsr[ei2 * 16 + k] = edge_csr_pos[ei2][k];
+            }
+            cuda_dyn_fill_csr_init(dyn_ctx,
+                h_ei.data(), h_ej.data(), h_ede.data(),
+                h_ecsr.data(), fixed_dim.data(),
+                (int)edge_list.size(), dim, csr_nnz);
+            dyn_fill_csr_inited = true;
+        }
+        {
+            // Pack Q_compact, N_compact, V_compact to flat arrays
+            std::vector<double> Qf(nQ_gpu * 3), Nf(nQ_gpu * 3), Vf(nQ_gpu * 3);
+            for (int i2 = 0; i2 < nQ_gpu; i2++) {
+                Qf[i2*3] = Q_compact[i2].x(); Qf[i2*3+1] = Q_compact[i2].y(); Qf[i2*3+2] = Q_compact[i2].z();
+                Nf[i2*3] = N_compact[i2].x(); Nf[i2*3+1] = N_compact[i2].y(); Nf[i2*3+2] = N_compact[i2].z();
+                Vf[i2*3] = V_compact[i2].x(); Vf[i2*3+1] = V_compact[i2].y(); Vf[i2*3+2] = V_compact[i2].z();
+            }
+            pack_diffs();
+            cuda_dyn_fill_csr(dyn_ctx, Qf.data(), Nf.data(), Vf.data(),
+                              diffs_flat.data(), x.data(),
+                              csr_val.data(), rhs.data());
+        }
+        // CPU fixup: set fixed and empty row diagonals (tiny cost)
+        for (int i = 0; i < dim; ++i) {
+            if (fixed_dim[i]) {
+                if (diag_pos[i] >= 0) csr_val[diag_pos[i]] = 1.0;
+                rhs(i) = x[i];
+            } else if (!row_has_entry[i]) {
+                if (diag_pos[i] >= 0) csr_val[diag_pos[i]] = 1.0;
+                rhs(i) = x[i];
+            }
+        }
+#else
         for (int ei = 0; ei < (int)edge_list.size(); ++ei) {
             auto& e = edge_list[ei];
             Vector3d qx = Q_compact[e.i];
@@ -753,13 +878,11 @@ void Optimizer::optimize_positions_dynamic(
             for (int ii = 0; ii < 4; ++ii) {
                 int row = vid[ii];
                 if (fixed_dim[row]) continue;
-                // RHS contribution
                 rhs(row) += weights[ii].dot(C);
                 for (int jj = 0; jj < 4; ++jj) {
                     int col = vid[jj];
                     double val = weights[ii].dot(weights[jj]);
                     if (fixed_dim[col]) {
-                        // Move fixed column contribution to RHS
                         rhs(row) -= val * x[col];
                     } else {
                         int pos = edge_csr_pos[ei][ii * 4 + jj];
@@ -768,8 +891,6 @@ void Optimizer::optimize_positions_dynamic(
                 }
             }
         }
-
-        // Set fixed and empty row diagonals
         for (int i = 0; i < dim; ++i) {
             if (fixed_dim[i]) {
                 if (diag_pos[i] >= 0) csr_val[diag_pos[i]] = 1.0;
@@ -779,6 +900,7 @@ void Optimizer::optimize_positions_dynamic(
                 rhs(i) = x[i];
             }
         }
+#endif
 
         int _t4 = GetCurrentTime64();
 
@@ -877,6 +999,7 @@ void Optimizer::optimize_positions_dynamic(
     }
 #ifdef WITH_CUDA
     if (pcg_ctx) cuda_pcg_destroy(pcg_ctx);
+    if (dyn_ctx) cuda_dyn_destroy(dyn_ctx);
 #endif
 }
 
@@ -1478,6 +1601,16 @@ void Optimizer::optimize_integer_constraints(Hierarchy& mRes, std::map<int, int>
                     printf("[TIMING]     solver=GPU-EdmondsKarp level=%d arcs=%zu supply=%d\n", level, arcs.size(), supply);
                     auto s = std::make_unique<CudaMaxFlowHelper>();
                     s->set_mode(3);
+                    solver = std::move(s);
+                } else if (fs == 5) {
+                    printf("[TIMING]     solver=GPU-EK-Persistent level=%d arcs=%zu supply=%d\n", level, arcs.size(), supply);
+                    auto s = std::make_unique<CudaMaxFlowHelper>();
+                    s->set_mode(5);
+                    solver = std::move(s);
+                } else if (fs == 6) {
+                    printf("[TIMING]     solver=GPU-Dinic-Persistent level=%d arcs=%zu supply=%d\n", level, arcs.size(), supply);
+                    auto s = std::make_unique<CudaMaxFlowHelper>();
+                    s->set_mode(6);
                     solver = std::move(s);
                 } else if (fs == 4) {
                     printf("[TIMING]     solver=GPU-Dinic level=%d arcs=%zu supply=%d\n", level, arcs.size(), supply);

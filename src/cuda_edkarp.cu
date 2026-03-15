@@ -14,6 +14,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cuda_runtime.h>
+#include <cooperative_groups.h>
+namespace cg = cooperative_groups;
 
 namespace qflow {
 
@@ -405,6 +407,258 @@ CudaMaxFlowResult cuda_edmonds_karp_solve(
 
 
 // ============================================================
+// Persistent BFS kernel for Edmonds-Karp
+//
+// Entire BFS (all levels) runs in ONE kernel launch.
+// Uses cooperative_groups grid.sync() for level synchronization.
+// Each thread handles multiple nodes via strided iteration.
+// Returns: parent[sink] != -1 if sink was reached.
+//
+// Also does trace-and-push in the same kernel (thread 0 only)
+// to avoid a separate kernel launch + host sync per augmentation.
+// ============================================================
+__global__ void k_ek_persistent_bfs_augment(
+    const int* nindex, const int* nlist, const int* cap, int* flow,
+    const int* rnindex, const int* rnlist, const int* retoe,
+    int num_nodes, int source, int sink,
+    int* parent, int* parent_edge, int* parent_dir,
+    int* frontier, int* next_frontier, int* frontier_size, int* next_count,
+    int* out_bottleneck,  // output: bottleneck capacity (0 if no path)
+    int* out_done         // output: set to 1 when no augmenting path found
+) {
+    cg::grid_group grid = cg::this_grid();
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = gridDim.x * blockDim.x;
+
+    // === Outer loop: each iteration is one complete BFS + augment ===
+    while (true) {
+        // -- Reset parent array --
+        for (int i = tid; i < num_nodes; i += stride)
+            parent[i] = -1;
+        grid.sync();
+
+        // -- Initialize frontier with source --
+        if (tid == 0) {
+            parent[source] = source;
+            frontier[0] = source;
+            *frontier_size = 1;
+            *next_count = 0;
+        }
+        grid.sync();
+
+        // -- BFS levels (single grid.sync per level) --
+        bool found = false;
+        while (true) {
+            int fsize = *frontier_size;
+            if (fsize == 0) break;
+
+            // Expand frontier: each thread processes multiple frontier nodes
+            for (int idx = tid; idx < fsize; idx += stride) {
+                int u = frontier[idx];
+
+                // Forward edges: u -> v with residual
+                for (int e = nindex[u]; e < nindex[u + 1]; e++) {
+                    int v = nlist[e];
+                    if (cap[e] - flow[e] <= 0) continue;
+                    if (atomicCAS(&parent[v], -1, u) == -1) {
+                        parent_edge[v] = e;
+                        parent_dir[v] = 1;
+                        int pos = atomicAdd(next_count, 1);
+                        next_frontier[pos] = v;
+                    }
+                }
+                // Backward edges: flow on e_fwd can be cancelled
+                for (int re = rnindex[u]; re < rnindex[u + 1]; re++) {
+                    int v = rnlist[re];
+                    int e_fwd = retoe[re];
+                    if (flow[e_fwd] <= 0) continue;
+                    if (atomicCAS(&parent[v], -1, u) == -1) {
+                        parent_edge[v] = e_fwd;
+                        parent_dir[v] = -1;
+                        int pos = atomicAdd(next_count, 1);
+                        next_frontier[pos] = v;
+                    }
+                }
+            }
+
+            // Thread 0 prepares next level BEFORE sync
+            if (tid == 0) {
+                *frontier_size = *next_count;
+                *next_count = 0;
+            }
+
+            grid.sync();  // Single sync: expansion complete + sizes visible
+
+            // Check if sink was reached
+            if (parent[sink] != -1) { found = true; break; }
+
+            // Pointer swap (all threads do this identically)
+            {
+                int* tmp = frontier;
+                frontier = next_frontier;
+                next_frontier = tmp;
+            }
+        }
+
+        if (!found) {
+            // No augmenting path — we're done
+            if (tid == 0) {
+                *out_done = 1;
+            }
+            return;
+        }
+
+        // -- Trace path and push flow (single thread) --
+        if (tid == 0) {
+            // Find bottleneck
+            int bn = 0x7FFFFFFF;
+            for (int v = sink; v != source; v = parent[v]) {
+                int e = parent_edge[v];
+                int r = (parent_dir[v] == 1) ? (cap[e] - flow[e]) : flow[e];
+                if (r < bn) bn = r;
+            }
+            // Push flow
+            for (int v = sink; v != source; v = parent[v]) {
+                int e = parent_edge[v];
+                if (parent_dir[v] == 1) flow[e] += bn; else flow[e] -= bn;
+            }
+            *out_bottleneck += bn;
+            *out_done = 0;
+        }
+
+        grid.sync();
+        // Loop back for next augmentation
+    }
+}
+
+
+// ============================================================
+// Edmonds-Karp with persistent BFS kernel (cooperative groups)
+//
+// Eliminates per-BFS-level kernel launch overhead by fusing
+// the entire BFS into one cooperative kernel launch.
+// The whole solve (all augmentations + BFS) is ONE kernel launch.
+// ============================================================
+CudaMaxFlowResult cuda_ek_persistent_solve(
+    int num_nodes, int source, int sink,
+    const int* h_nindex, const int* h_nlist, const int* h_cap,
+    int num_edges,
+    const int* h_rnindex, const int* h_rnlist, const int* h_retoe
+) {
+    CudaMaxFlowResult result;
+    result.edge_flows.resize(num_edges);
+
+    auto t_start = std::chrono::high_resolution_clock::now();
+
+    // Allocate GPU memory
+    int *d_nindex, *d_nlist, *d_cap, *d_flow;
+    int *d_rnindex, *d_rnlist, *d_retoe;
+    int *d_parent, *d_parent_edge, *d_parent_dir;
+    int *d_frontier, *d_next_frontier, *d_frontier_size, *d_next_count;
+    int *d_bottleneck, *d_done;
+
+    cudaMalloc(&d_nindex, (num_nodes+1)*sizeof(int));
+    cudaMalloc(&d_nlist, num_edges*sizeof(int));
+    cudaMalloc(&d_cap, num_edges*sizeof(int));
+    cudaMalloc(&d_flow, num_edges*sizeof(int));
+    cudaMalloc(&d_rnindex, (num_nodes+1)*sizeof(int));
+    cudaMalloc(&d_rnlist, num_edges*sizeof(int));
+    cudaMalloc(&d_retoe, num_edges*sizeof(int));
+    cudaMalloc(&d_parent, num_nodes*sizeof(int));
+    cudaMalloc(&d_parent_edge, num_nodes*sizeof(int));
+    cudaMalloc(&d_parent_dir, num_nodes*sizeof(int));
+    cudaMalloc(&d_frontier, num_nodes*sizeof(int));
+    cudaMalloc(&d_next_frontier, num_nodes*sizeof(int));
+    cudaMalloc(&d_frontier_size, sizeof(int));
+    cudaMalloc(&d_next_count, sizeof(int));
+    cudaMalloc(&d_bottleneck, sizeof(int));
+    cudaMalloc(&d_done, sizeof(int));
+
+    cudaMemcpy(d_nindex, h_nindex, (num_nodes+1)*sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_nlist, h_nlist, num_edges*sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_cap, h_cap, num_edges*sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_rnindex, h_rnindex, (num_nodes+1)*sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_rnlist, h_rnlist, num_edges*sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_retoe, h_retoe, num_edges*sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemset(d_flow, 0, num_edges*sizeof(int));
+    cudaMemset(d_bottleneck, 0, sizeof(int));
+    cudaMemset(d_done, 0, sizeof(int));
+
+    // Query max cooperative launch occupancy
+    int block_size = 256;
+    int num_blocks = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &num_blocks, k_ek_persistent_bfs_augment, block_size, 0);
+
+    int device;
+    cudaGetDevice(&device);
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, device);
+    int max_blocks = num_blocks * prop.multiProcessorCount;
+
+    printf("[EK-PERSISTENT] Launching persistent kernel: %d blocks x %d threads = %d threads (SMs=%d)\n",
+           max_blocks, block_size, max_blocks * block_size, prop.multiProcessorCount);
+
+    auto t_launch = std::chrono::high_resolution_clock::now();
+
+    // Launch cooperative kernel — entire solve in one launch
+    void* args[] = {
+        &d_nindex, &d_nlist, &d_cap, &d_flow,
+        &d_rnindex, &d_rnlist, &d_retoe,
+        &num_nodes, &source, &sink,
+        &d_parent, &d_parent_edge, &d_parent_dir,
+        &d_frontier, &d_next_frontier, &d_frontier_size, &d_next_count,
+        &d_bottleneck, &d_done
+    };
+
+    cudaError_t err = cudaLaunchCooperativeKernel(
+        (void*)k_ek_persistent_bfs_augment,
+        dim3(max_blocks), dim3(block_size),
+        args, 0, 0);
+
+    if (err != cudaSuccess) {
+        printf("[EK-PERSISTENT] ERROR: cudaLaunchCooperativeKernel failed: %s\n",
+               cudaGetErrorString(err));
+        printf("[EK-PERSISTENT] Falling back to standard Edmonds-Karp\n");
+        // Fallback to regular EK
+        cudaFree(d_nindex); cudaFree(d_nlist); cudaFree(d_cap); cudaFree(d_flow);
+        cudaFree(d_rnindex); cudaFree(d_rnlist); cudaFree(d_retoe);
+        cudaFree(d_parent); cudaFree(d_parent_edge); cudaFree(d_parent_dir);
+        cudaFree(d_frontier); cudaFree(d_next_frontier);
+        cudaFree(d_frontier_size); cudaFree(d_next_count);
+        cudaFree(d_bottleneck); cudaFree(d_done);
+        return cuda_edmonds_karp_solve(num_nodes, source, sink,
+            h_nindex, h_nlist, h_cap, num_edges,
+            h_rnindex, h_rnlist, h_retoe);
+    }
+
+    cudaDeviceSynchronize();
+
+    auto t_end = std::chrono::high_resolution_clock::now();
+
+    // Read results
+    int total_flow = 0;
+    cudaMemcpy(&total_flow, d_bottleneck, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(result.edge_flows.data(), d_flow, num_edges*sizeof(int), cudaMemcpyDeviceToHost);
+
+    double ms_total = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    double ms_kernel = std::chrono::duration<double, std::milli>(t_end - t_launch).count();
+    printf("[TIMING]       GPU EK-Persistent: flow=%d (kernel=%.1f ms, total=%.1f ms)\n",
+           total_flow, ms_kernel, ms_total);
+
+    cudaFree(d_nindex); cudaFree(d_nlist); cudaFree(d_cap); cudaFree(d_flow);
+    cudaFree(d_rnindex); cudaFree(d_rnlist); cudaFree(d_retoe);
+    cudaFree(d_parent); cudaFree(d_parent_edge); cudaFree(d_parent_dir);
+    cudaFree(d_frontier); cudaFree(d_next_frontier);
+    cudaFree(d_frontier_size); cudaFree(d_next_count);
+    cudaFree(d_bottleneck); cudaFree(d_done);
+
+    result.max_flow = total_flow;
+    return result;
+}
+
+
+// ============================================================
 // GPU Dinic's: Dinic phases for bulk flow, Edmonds-Karp for stragglers
 //
 // Phase 1: Dinic's (fwd BFS + bwd BFS + multi-augment) — gets ~83% of flow fast
@@ -774,6 +1028,220 @@ CudaMaxFlowResult cuda_dinic_solve(
     cudaFree(d_parent); cudaFree(d_parent_edge); cudaFree(d_parent_dir);
     cudaFree(d_frontier); cudaFree(d_next_frontier); cudaFree(d_next_count);
     cudaFree(d_total_flow); cudaFree(d_num_paths); cudaFree(d_bottleneck);
+
+    result.max_flow = total_flow;
+    return result;
+}
+
+// ============================================================
+// Dinic + Persistent EK: Dinic for bulk, persistent kernel for remainder
+// ============================================================
+CudaMaxFlowResult cuda_dinic_persistent_solve(
+    int num_nodes, int source, int sink,
+    const int* h_nindex, const int* h_nlist, const int* h_cap,
+    int num_edges,
+    const int* h_rnindex, const int* h_rnlist, const int* h_retoe
+) {
+    CudaMaxFlowResult result;
+    result.edge_flows.resize(num_edges);
+
+    int *d_nindex, *d_nlist, *d_cap, *d_flow;
+    int *d_rnindex, *d_rnlist, *d_retoe;
+    int *d_level, *d_reach;
+    int *d_parent, *d_parent_edge, *d_parent_dir;
+    int *d_frontier, *d_next_frontier, *d_next_count;
+    int *d_frontier_size;
+    int *d_total_flow, *d_num_paths, *d_bottleneck, *d_done;
+
+    cudaMalloc(&d_nindex, (num_nodes+1)*sizeof(int));
+    cudaMalloc(&d_nlist, num_edges*sizeof(int));
+    cudaMalloc(&d_cap, num_edges*sizeof(int));
+    cudaMalloc(&d_flow, num_edges*sizeof(int));
+    cudaMalloc(&d_rnindex, (num_nodes+1)*sizeof(int));
+    cudaMalloc(&d_rnlist, num_edges*sizeof(int));
+    cudaMalloc(&d_retoe, num_edges*sizeof(int));
+    cudaMalloc(&d_level, num_nodes*sizeof(int));
+    cudaMalloc(&d_reach, num_nodes*sizeof(int));
+    cudaMalloc(&d_parent, num_nodes*sizeof(int));
+    cudaMalloc(&d_parent_edge, num_nodes*sizeof(int));
+    cudaMalloc(&d_parent_dir, num_nodes*sizeof(int));
+    cudaMalloc(&d_frontier, num_nodes*sizeof(int));
+    cudaMalloc(&d_next_frontier, num_nodes*sizeof(int));
+    cudaMalloc(&d_next_count, sizeof(int));
+    cudaMalloc(&d_frontier_size, sizeof(int));
+    cudaMalloc(&d_total_flow, sizeof(int));
+    cudaMalloc(&d_num_paths, sizeof(int));
+    cudaMalloc(&d_bottleneck, sizeof(int));
+    cudaMalloc(&d_done, sizeof(int));
+
+    cudaMemcpy(d_nindex, h_nindex, (num_nodes+1)*sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_nlist, h_nlist, num_edges*sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_cap, h_cap, num_edges*sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_rnindex, h_rnindex, (num_nodes+1)*sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_rnlist, h_rnlist, num_edges*sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_retoe, h_retoe, num_edges*sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemset(d_flow, 0, num_edges*sizeof(int));
+
+    const int B = 256;
+    int total_flow = 0, total_paths = 0, dinic_phases = 0;
+    int src_val = source, sink_val = sink;
+
+    auto t_start = std::chrono::high_resolution_clock::now();
+
+    // ==== PHASE 1: Dinic's (bulk flow) ====
+    while (true) {
+        cudaMemset(d_level, 0xFF, num_nodes*sizeof(int));
+        int zero = 0;
+        cudaMemcpy(d_level+source, &zero, sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_frontier, &src_val, sizeof(int), cudaMemcpyHostToDevice);
+
+        int fsize = 1, current_level = 0;
+        bool found_sink = false;
+
+        while (fsize > 0) {
+            cudaMemset(d_next_count, 0, sizeof(int));
+            k_dinic_bfs_expand<<<(fsize+B-1)/B, B>>>(
+                d_nindex, d_nlist, d_cap, d_flow,
+                d_rnindex, d_rnlist, d_retoe,
+                d_frontier, fsize, current_level,
+                d_level, d_next_frontier, d_next_count);
+            int sink_lev;
+            cudaMemcpy(&sink_lev, d_level+sink, sizeof(int), cudaMemcpyDeviceToHost);
+            if (sink_lev >= 0) { found_sink = true; break; }
+            cudaMemcpy(&fsize, d_next_count, sizeof(int), cudaMemcpyDeviceToHost);
+            std::swap(d_frontier, d_next_frontier);
+            current_level++;
+        }
+
+        if (!found_sink) break;
+
+        // Backward BFS: mark nodes that can reach sink
+        cudaMemset(d_reach, 0, num_nodes*sizeof(int));
+        int one = 1;
+        cudaMemcpy(d_reach+sink, &one, sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_frontier, &sink_val, sizeof(int), cudaMemcpyHostToDevice);
+        fsize = 1;
+
+        while (fsize > 0) {
+            cudaMemset(d_next_count, 0, sizeof(int));
+            k_dinic_bfs_backward<<<(fsize+B-1)/B, B>>>(
+                d_nindex, d_nlist, d_rnindex, d_rnlist, d_retoe,
+                d_cap, d_flow, d_level,
+                d_frontier, fsize,
+                d_reach, d_next_frontier, d_next_count);
+            cudaMemcpy(&fsize, d_next_count, sizeof(int), cudaMemcpyDeviceToHost);
+            std::swap(d_frontier, d_next_frontier);
+        }
+
+        // Multi-augment on pruned level graph
+        k_dinic_multi_augment<<<1, 1>>>(
+            d_nindex, d_nlist, d_rnindex, d_rnlist, d_retoe,
+            d_cap, d_flow, d_level, d_reach,
+            source, sink, d_total_flow, d_num_paths);
+
+        int phase_flow, phase_paths;
+        cudaMemcpy(&phase_flow, d_total_flow, sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(&phase_paths, d_num_paths, sizeof(int), cudaMemcpyDeviceToHost);
+
+        total_flow += phase_flow;
+        total_paths += phase_paths;
+        dinic_phases++;
+
+        if (phase_flow == 0) break;
+    }
+
+    auto t_dinic = std::chrono::high_resolution_clock::now();
+    double ms_dinic = std::chrono::duration<double, std::milli>(t_dinic - t_start).count();
+    printf("[TIMING]       GPU Dinic phase: %d phases, %d paths, flow=%d (%.1f ms)\n",
+           dinic_phases, total_paths, total_flow, ms_dinic);
+
+    // ==== PHASE 2: Persistent EK for remaining flow ====
+    {
+        cudaMemset(d_bottleneck, 0, sizeof(int));
+        cudaMemset(d_done, 0, sizeof(int));
+
+        int block_size = 256;
+        int num_blocks = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &num_blocks, k_ek_persistent_bfs_augment, block_size, 0);
+        int device;
+        cudaGetDevice(&device);
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, device);
+        int max_blocks = num_blocks * prop.multiProcessorCount;
+
+        void* args[] = {
+            &d_nindex, &d_nlist, &d_cap, &d_flow,
+            &d_rnindex, &d_rnlist, &d_retoe,
+            &num_nodes, &source, &sink,
+            &d_parent, &d_parent_edge, &d_parent_dir,
+            &d_frontier, &d_next_frontier, &d_frontier_size, &d_next_count,
+            &d_bottleneck, &d_done
+        };
+
+        cudaError_t err = cudaLaunchCooperativeKernel(
+            (void*)k_ek_persistent_bfs_augment,
+            dim3(max_blocks), dim3(block_size),
+            args, 0, 0);
+
+        if (err != cudaSuccess) {
+            printf("[DINIC-PERSISTENT] Cooperative launch failed: %s, falling back to standard EK\n",
+                   cudaGetErrorString(err));
+            // Standard EK fallback
+            int ek_augs = 0;
+            while (true) {
+                cudaMemset(d_parent, 0xFF, num_nodes*sizeof(int));
+                cudaMemcpy(d_parent+source, &src_val, sizeof(int), cudaMemcpyHostToDevice);
+                cudaMemcpy(d_frontier, &src_val, sizeof(int), cudaMemcpyHostToDevice);
+                int fs2 = 1;
+                bool found = false;
+                while (fs2 > 0) {
+                    cudaMemset(d_next_count, 0, sizeof(int));
+                    k_ek_bfs_expand<<<(fs2+B-1)/B, B>>>(
+                        d_nindex, d_nlist, d_cap, d_flow,
+                        d_rnindex, d_rnlist, d_retoe,
+                        d_frontier, fs2,
+                        d_parent, d_parent_edge, d_parent_dir,
+                        d_next_frontier, d_next_count);
+                    int sp;
+                    cudaMemcpy(&sp, d_parent+sink, sizeof(int), cudaMemcpyDeviceToHost);
+                    if (sp != -1) { found = true; break; }
+                    cudaMemcpy(&fs2, d_next_count, sizeof(int), cudaMemcpyDeviceToHost);
+                    std::swap(d_frontier, d_next_frontier);
+                }
+                if (!found) break;
+                k_ek_trace_push<<<1,1>>>(d_parent, d_parent_edge, d_parent_dir,
+                                          d_cap, d_flow, source, sink, d_bottleneck);
+                int bn;
+                cudaMemcpy(&bn, d_bottleneck, sizeof(int), cudaMemcpyDeviceToHost);
+                total_flow += bn;
+                ek_augs++;
+            }
+            if (ek_augs > 0)
+                printf("[TIMING]       EK fallback: %d augs, total flow=%d\n", ek_augs, total_flow);
+        } else {
+            cudaDeviceSynchronize();
+            int ek_flow = 0;
+            cudaMemcpy(&ek_flow, d_bottleneck, sizeof(int), cudaMemcpyDeviceToHost);
+            total_flow += ek_flow;
+
+            auto t_ek = std::chrono::high_resolution_clock::now();
+            double ms_ek = std::chrono::duration<double, std::milli>(t_ek - t_dinic).count();
+            printf("[TIMING]       Persistent EK fallback: flow=%d (%.1f ms), total flow=%d\n",
+                   ek_flow, ms_ek, total_flow);
+        }
+    }
+
+    cudaMemcpy(result.edge_flows.data(), d_flow, num_edges*sizeof(int), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_nindex); cudaFree(d_nlist); cudaFree(d_cap); cudaFree(d_flow);
+    cudaFree(d_rnindex); cudaFree(d_rnlist); cudaFree(d_retoe);
+    cudaFree(d_level); cudaFree(d_reach);
+    cudaFree(d_parent); cudaFree(d_parent_edge); cudaFree(d_parent_dir);
+    cudaFree(d_frontier); cudaFree(d_next_frontier); cudaFree(d_next_count);
+    cudaFree(d_frontier_size);
+    cudaFree(d_total_flow); cudaFree(d_num_paths); cudaFree(d_bottleneck);
+    cudaFree(d_done);
 
     result.max_flow = total_flow;
     return result;

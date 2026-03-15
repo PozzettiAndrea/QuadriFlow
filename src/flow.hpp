@@ -581,6 +581,26 @@ class CudaMaxFlowHelper : public MaxFlowHelper {
             return result_.max_flow;
         }
 
+        if (mode == 5) {
+            // ---- GPU Edmonds-Karp with persistent BFS kernel ----
+            result_ = cuda_ek_persistent_solve(
+                num_nodes_, source, sink,
+                nindex.data(), nlist.data(), cap.data(), num_edges,
+                rnindex.data(), rnlist.data(), retoe.data()
+            );
+            return result_.max_flow;
+        }
+
+        if (mode == 6) {
+            // ---- GPU Dinic + persistent EK fallback ----
+            result_ = cuda_dinic_persistent_solve(
+                num_nodes_, source, sink,
+                nindex.data(), nlist.data(), cap.data(), num_edges,
+                rnindex.data(), rnlist.data(), retoe.data()
+            );
+            return result_.max_flow;
+        }
+
         // ---- mode == 4: GPU Dinic's (fwd BFS + bwd BFS + multi-augment) ----
         result_ = cuda_dinic_solve(
             num_nodes_, source, sink,

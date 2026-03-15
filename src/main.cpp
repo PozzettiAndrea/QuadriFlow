@@ -42,7 +42,7 @@ static void print_usage() {
     printf("  -ff-depth <n>           FixFlip max recursion depth (default: 5)\n");
     printf("  -subdiv <strategy>      Subdivide strategy: cpu, cuda\n");
     printf("  -dse <strategy>         DownsampleEdgeGraph strategy: cpu, cuda\n");
-    printf("  -flow <strategy>        Max-flow solver: boykov, cuda, lemon, edkarp, dinic\n");
+    printf("  -flow <strategy>        Max-flow solver: boykov, cuda, lemon, edkarp, ek-persistent, dinic, dinic-persistent\n");
     printf("\n");
     printf("Checkpoint options:\n");
     printf("  -save-dir <dir>         Directory for checkpoint files\n");
@@ -120,12 +120,14 @@ int main(int argc, char** argv) {
             else if (strcmp(s, "cuda") == 0)  field.hierarchy.flow_strategy = 1;
             else if (strcmp(s, "lemon") == 0) field.hierarchy.flow_strategy = 2;
             else if (strcmp(s, "edkarp") == 0) field.hierarchy.flow_strategy = 3;
+            else if (strcmp(s, "ek-persistent") == 0) field.hierarchy.flow_strategy = 5;
             else if (strcmp(s, "dinic") == 0) field.hierarchy.flow_strategy = 4;
-            else { printf("Unknown -flow strategy: %s (valid: boykov, cuda, lemon, edkarp, dinic)\n", s); return 1; }
+            else if (strcmp(s, "dinic-persistent") == 0) field.hierarchy.flow_strategy = 6;
+            else { printf("Unknown -flow strategy: %s (valid: boykov, cuda, lemon, edkarp, ek-persistent, dinic, dinic-persistent)\n", s); return 1; }
         } else if (strcmp(argv[i], "-G") == 0 || strcmp(argv[i], "--cuda") == 0) {
             field.hierarchy.subdiv_strategy = 1;
             field.hierarchy.dse_strategy = 1;
-            field.hierarchy.flow_strategy = 3;  // edkarp (reliable)
+            field.hierarchy.flow_strategy = 6;  // dinic-persistent (fastest, good quality)
             // fixflip stays cpu (GPU doesn't help, see experiments.md §6)
         } else if (strcmp(argv[i], "-save-dir") == 0 && i + 1 < argc) {
             save_dir = argv[++i];

@@ -56,6 +56,25 @@ extern void UpdatePosition(int* phase, int num_phases, glm::dvec3* N, glm::dvec3
 extern void PropagatePositionUpper(glm::dvec3* srcField, int num_position, glm::ivec2* toUpper,
                                    glm::dvec3* N, glm::dvec3* V, glm::dvec3* destField);
 
+// Dynamic optimization GPU kernels
+extern "C" void* cuda_dyn_init(
+    const double* V_colmaj, const double* N_colmaj, int nV,
+    const int* adj_ptr, const int* adj_list, int adj_nnz,
+    const int* vset_ptr, const int* vset_list, int vset_nnz,
+    const int* dedge_ptr, const int* dedge_list, int dedge_nnz,
+    int nQ, int nDE);
+extern "C" void cuda_dyn_find_nearest(
+    void* context, double* h_O_compact, int* h_Vind, double* h_diffs, int iteration);
+extern "C" void cuda_dyn_fill_csr_init(
+    void* context, const int* h_edge_i, const int* h_edge_j, const int* h_edge_de,
+    const int* h_edge_csr_pos, const int* h_fixed_dim,
+    int nEdges, int dim, int csr_nnz);
+extern "C" void cuda_dyn_fill_csr(
+    void* context, const double* h_Q_compact, const double* h_N_compact,
+    const double* h_V_compact, const double* h_diffs, const double* h_x,
+    double* h_csr_val, double* h_rhs);
+extern "C" void cuda_dyn_destroy(void* context);
+
 #endif
 
 } // namespace qflow

@@ -33,6 +33,31 @@ CudaMaxFlowResult cuda_edmonds_karp_solve(
     const int* h_retoe
 );
 
+// GPU Edmonds-Karp with persistent BFS kernel (cooperative groups)
+// Eliminates per-BFS-level kernel launch overhead
+CudaMaxFlowResult cuda_ek_persistent_solve(
+    int num_nodes, int source, int sink,
+    const int* h_nindex,
+    const int* h_nlist,
+    const int* h_cap,
+    int num_edges,
+    const int* h_rnindex,
+    const int* h_rnlist,
+    const int* h_retoe
+);
+
+// GPU Dinic + persistent EK fallback
+CudaMaxFlowResult cuda_dinic_persistent_solve(
+    int num_nodes, int source, int sink,
+    const int* h_nindex,
+    const int* h_nlist,
+    const int* h_cap,
+    int num_edges,
+    const int* h_rnindex,
+    const int* h_rnlist,
+    const int* h_retoe
+);
+
 // GPU Dinic's: forward BFS + backward BFS pruning + multi-augment on GPU
 CudaMaxFlowResult cuda_dinic_solve(
     int num_nodes, int source, int sink,

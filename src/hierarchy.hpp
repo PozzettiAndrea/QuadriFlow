@@ -65,8 +65,10 @@ class Hierarchy {
     //   2 = "lemon"          — LEMON Preflow (CPU)
     //   3 = "edkarp"         — GPU Edmonds-Karp (GPU BFS + GPU augment, good quality)
     //   4 = "dinic"          — GPU Dinic's (GPU fwd+bwd BFS + GPU multi-augment, fastest)
+    //   5 = "ek-persistent"  — GPU EK with persistent BFS kernel (cooperative groups, less launch overhead)
+    //   6 = "dinic-persistent" — GPU Dinic + persistent EK fallback
 #ifdef WITH_CUDA
-    int flow_strategy = 3;  // default: GPU Edmonds-Karp (reliable, good quality)
+    int flow_strategy = 6;  // default: GPU Dinic + persistent EK fallback
 #else
     int flow_strategy = 0;  // default: boykov when no CUDA
 #endif

@@ -159,7 +159,7 @@ set(
 )
 
 if (BUILD_CUDA)
-    list(APPEND quadriflow_SRC src/Optimizer.cu src/cuda_maxflow.cu src/cuda_edkarp.cu src/init_kernels.cu src/downsample_gpu.cu src/subdivide_gpu.cu)
+    list(APPEND quadriflow_SRC src/Optimizer.cu src/cuda_maxflow.cu src/cuda_edkarp.cu src/init_kernels.cu src/downsample_gpu.cu src/subdivide_gpu.cu src/dynamic_gpu.cu)
 endif()
 
 add_executable(
@@ -175,7 +175,7 @@ add_library(
 set_property(TARGET quadriflow_exe PROPERTY OUTPUT_NAME quadriflow)                                          
 
 if (BUILD_CUDA)
-    set_source_files_properties(src/Optimizer.cu src/cuda_maxflow.cu src/cuda_edkarp.cu src/init_kernels.cu src/downsample_gpu.cu PROPERTIES LANGUAGE CUDA)
+    set_source_files_properties(src/Optimizer.cu src/cuda_maxflow.cu src/cuda_edkarp.cu src/init_kernels.cu src/downsample_gpu.cu src/dynamic_gpu.cu PROPERTIES LANGUAGE CUDA)
     set_target_properties(quadriflow PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
     set_target_properties(quadriflow_exe PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endif()

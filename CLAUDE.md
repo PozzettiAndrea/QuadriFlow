@@ -61,8 +61,10 @@ PATH=/usr/local/cuda-13/bin:/usr/bin:/bin:$PATH cmake .. -DCMAKE_BUILD_TYPE=Rele
 |----------|------|------|-----------|-------|
 | boykov | 0 | 111s | 50K | Boost BK, baseline |
 | cuda | 1 | ~8s | 79K | GPU PR + refinement |
-| edkarp | 3 | 25.7s | 43K | **Default.** GPU EK, best quality/speed |
-| dinic | 4 | varies | varies | WIP, cleanup phase has issues |
+| edkarp | 3 | 28s | 43K | GPU EK |
+| dinic | 4 | 19s | 44K | GPU Dinic + EK fallback |
+| ek-persistent | 5 | 24s | 44K | GPU EK with cooperative groups |
+| dinic-persistent | 6 | **13s** | 44K | **Default.** Dinic + persistent EK fallback |
 
 ## Paper Library
 53 papers in `/home/shadeform/relevant_papers_cuda_remeshing/` covering:
@@ -74,21 +76,22 @@ PATH=/usr/local/cuda-13/bin:/usr/bin:/bin:$PATH cmake .. -DCMAKE_BUILD_TYPE=Rele
 ## Council of Boffins
 Debate format for hard problems. 4 experts: Lena (geometer), Ravi (graph theory), Doug (NVIDIA systems), Keiko (CUDA kernels). Description at `/home/shadeform/boffins.md`. 21 sessions documented in conversation history.
 
-## Current Best Timings (per-stage, from checkpoints)
+## Current Best Timings (full pipeline, Release mode)
 | Stage | Time | Device |
 |---|---|---|
-| Initialize (GPU subdiv) | ~4.4s | CPU+GPU |
-| Field solving | ~4.3s | GPU |
-| BuildIntegerConstraints | ~4.5s | CPU |
-| ComputeMaxFlow (edkarp) | ~25s | GPU |
-| subdivide_edgeDiff (1st) | ~3.4s | CPU |
-| FixFlipHierarchy (depth=3) | ~4.1s | CPU |
-| subdivide_edgeDiff (2nd) | ~2.6s | CPU |
-| optimize_positions_sharp+fixed | ~7.3s | CPU+GPU |
-| AdvancedExtractQuad | ~4.3s | CPU |
-| pre-dynamic + dynamic | ~11s | CPU+GPU |
-| **TOTAL** | **~71s** | |
-| **vs Boykov baseline** | **~160s** | **2.3x faster** |
+| Initialize (GPU subdiv) | ~4-5s | CPU+GPU |
+| Field solving | ~4-5s | GPU |
+| BuildIntegerConstraints | ~4-6s | CPU |
+| ComputeMaxFlow (dinic-persistent) | **~14s** | GPU |
+| subdivide_edgeDiff (1st) | ~2.5-5s | CPU |
+| FixFlipHierarchy (depth=3) | ~3.8-9s | CPU |
+| subdivide_edgeDiff (2nd) | SKIPPED | CPU |
+| optimize_positions_sharp+fixed | ~2.5-5.8s | CPU+GPU |
+| AdvancedExtractQuad | ~3.8s | CPU |
+| pre-dynamic + dynamic | ~7.5-12s | CPU+GPU |
+| **TOTAL** | **~41s** | |
+| **vs edkarp** | **~61s** | **1.5x faster** |
+| **vs Boykov baseline** | **~160s** | **3.9x faster** |
 
 ## Key Findings
 - GPU subdivision: Luby-like independent set with length-based priority prevents race conditions
@@ -106,8 +109,10 @@ Debate format for hard problems. 4 experts: Lena (geometer), Ravi (graph theory)
 | Approach | Result | Status |
 |---|---|---|
 | GPU subdivision (Luby IS) | 10.8x speedup | **Working** |
-| GPU Edmonds-Karp flow | 4.4x vs Boykov | **Working (default)** |
-| GPU Dinic + EK hybrid | 6.3x vs Boykov | Cleanup phase buggy |
+| GPU Edmonds-Karp flow | 4.4x vs Boykov | **Working** |
+| GPU Dinic + persistent EK | **8.5x vs Boykov** | **Working (default)** |
+| GPU Dinic + EK hybrid | 5.8x vs Boykov | Working |
+| Persistent kernel EK (coop groups) | 4.6x vs Boykov | Working |
 | GPU push-relabel + refinement | Fast but poor quality | Available as strategy |
 | unordered_map optimization | -4s across stages | **Working** |
 | FixFlip depth cap | -2.2s | **Working (depth=3)** |
@@ -119,3 +124,38 @@ Debate format for hard problems. 4 experts: Lena (geometer), Ravi (graph theory)
 | JF-Cut push-relabel | Grid-only algorithm | Failed |
 | Selective BFS reset | D2D copy overhead | Failed |
 | Penner optimization | NaN/slow on real meshes | Not viable yet |
+
+## WIP: GPU Dynamic Optimization (src/dynamic_gpu.cu)
+
+**Status:** Code written, not yet building. Needs `cmake ..` re-run to pick up new .cu file.
+
+Two GPU kernels for the pre-dynamic + dynamic optimization stage (currently 9-10s):
+
+1. **k_find_nearest** — Parallel manifold walk. Each thread handles one quad vertex,
+   walking the mesh adjacency graph to find the nearest base vertex. Rotates diffs
+   vectors along the walk path. 187K threads, replaces CPU loop (1.4s → ~5ms).
+
+2. **k_fill_csr** — Parallel sparse matrix assembly. Each thread handles one edge,
+   computing 16 dot products and atomically adding to CSR values + RHS.
+   ~187K threads, replaces CPU loop (0.6s → ~1ms).
+
+**Files:**
+- `src/dynamic_gpu.cu` — CUDA kernels + host wrappers
+- `src/optimizer.cpp` — Modified to call GPU versions when WITH_CUDA
+- `src/optimizer.hpp` — Added extern "C" declarations
+
+**To finish:**
+```bash
+cd build
+PATH=/usr/local/cuda-13/bin:/usr/bin:/bin:$PATH cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_CUDA=ON -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-11
+make -j$(nproc)
+# Test:
+./quadriflow -i ../examples/dragon.obj -o /tmp/out.obj -f 100000 -G
+```
+
+**Expected savings:** FindNearest 1.4s → ~5ms, fillCSR 0.6s → ~1ms = ~2s saved per run.
+
+**Council of Boffins Session 30 notes:** Full debate in plan file. Additional targets after GPU kernels:
+- Pre-dynamic diffs (1.71s): replace unordered_map with GPU hash table or sorted lookup
+- PCG solve (3.66s): replace IC0 with AmgX multigrid (fewer iterations)
+- Fully GPU-resident loop: eliminate H2D/D2H transfers (~2.7s overhead)
